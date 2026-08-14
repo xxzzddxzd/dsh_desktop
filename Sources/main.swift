@@ -18,12 +18,23 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         // Wiring
         AppState.shared.onChange = { [weak self] in self?.refreshUI() }
-        AppState.shared.onBubble = { [weak self] title, body in
+        AppState.shared.onBubble = { [weak self] title, body, sessionId in
             BubbleController.shared.show(title: title, body: body,
                                          anchor: self?.statusItemCtrl.button,
                                          onClick: {
                 guard let self, let button = self.statusItemCtrl.button else { return }
-                self.panelCtrl.togglePopover(relativeTo: button)
+                if !sessionId.isEmpty {
+                    // The bubble belongs to one session: open it and consume
+                    // the queued event.
+                    if !self.panelCtrl.isPopoverShown {
+                        self.panelCtrl.togglePopover(relativeTo: button)
+                    }
+                    self.panelCtrl.openSession(id: sessionId, title: "")
+                    AppState.shared.consumeFrontEvent()
+                    if self.panelCtrl.isPopoverShown { self.installDismissMonitors() }
+                } else {
+                    self.panelCtrl.togglePopover(relativeTo: button)
+                }
             })
         }
         AppState.shared.onApproval = { [weak self] info in
@@ -35,6 +46,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
         statusItemCtrl.onLeftClick = { [weak self] in
             guard let self, let button = self.statusItemCtrl.button else { return }
+            // A queued completion is showing: click opens THAT session and
+            // dequeues the event (the next queued one then surfaces).
+            if let ev = AppState.shared.snapshot().statusEvent, !ev.sessionId.isEmpty {
+                if !self.panelCtrl.isPopoverShown {
+                    self.panelCtrl.togglePopover(relativeTo: button)
+                }
+                self.panelCtrl.openSession(id: ev.sessionId, title: ev.title)
+                AppState.shared.consumeFrontEvent()
+                if self.panelCtrl.isPopoverShown { self.installDismissMonitors() }
+                return
+            }
             self.panelCtrl.togglePopover(relativeTo: button)
             if self.panelCtrl.isPopoverShown { self.installDismissMonitors() }
         }
@@ -107,7 +129,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         panelCtrl.onOpenBrowser = { [weak self] in self?.openInBrowser() }
         panelCtrl.onOpenSettings = { [weak self] in self?.settingsCtrl.show() }
         panelCtrl.onQuit = { [weak self] in self?.quit() }
-        panelCtrl.onDismiss = { [weak self] in self?.removeDismissMonitors() }
+        panelCtrl.onDismiss = { [weak self] in
+            self?.removeDismissMonitors()
+            self?.statusItemCtrl.unfreezeForPanel()
+        }
+        panelCtrl.onPopoverShown = { [weak self] in
+            self?.statusItemCtrl.freezeForPanel()
+        }
 
         settingsCtrl.onSaved = { [weak self] in self?.reconfigure() }
 
@@ -127,6 +155,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 AppState.shared.ingestMuxFrame(payload, rpcId: rpcId)
             }
         }
+        AppState.shared.noteMuxConnected()
 
         // Environment gate: find the dsh CLI first; onboard the user when it
         // is missing. The server boots only once the environment is ready.
@@ -264,6 +293,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 let dict = value as? [String: Any] ?? [:]
                 let items = dict["items"] as? [[String: Any]] ?? []
                 AppState.shared.ingestSessionList(items)
+            }
+        }
+        rpc.call("workspace.list", timeout: 6) { result in
+            if case .success(let value) = result,
+               let dict = value as? [String: Any] {
+                AppState.shared.ingestWorkspaceList(dict)
             }
         }
     }

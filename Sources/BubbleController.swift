@@ -18,6 +18,7 @@ final class BubbleController {
               buttons: [(title: String, action: () -> Void)] = [],
               tag: String = "",
               onClick: (() -> Void)?) {
+        LogStore.shared.append("bubble-show: \(title) ttl=\(ttl)", source: "desktop")
         clickHandler = onClick
         activeTag = tag
         let content = buildContent(title: title, body: body, buttons: buttons)
@@ -32,10 +33,23 @@ final class BubbleController {
 
         // Position below the status item (or top-right fallback).
         var origin = NSPoint.zero
-        if let anchor, let anchorWindow = anchor.window {
-            let screenFrame = anchorWindow.convertToScreen(anchor.convert(anchor.bounds, to: nil))
+        if let anchor {
+            // Status bar items live in a flipped window: convert through the
+            // window so the screen frame is correct.
+            var screenFrame = anchor.convert(anchor.bounds, to: nil)
+            if let anchorWindow = anchor.window {
+                screenFrame = anchorWindow.convertToScreen(anchor.convert(anchor.bounds, to: nil))
+            } else {
+                // Last resort: treat as flipped screen coords (top-left origin).
+                if let screen = NSScreen.main {
+                    screenFrame.origin.y = screen.frame.maxY - screenFrame.maxY
+                }
+            }
             origin.x = screenFrame.midX - contentSize.width / 2
             origin.y = screenFrame.minY - contentSize.height - 8
+            if Settings.shared.debugDump {
+                LogStore.shared.append("bubble-pos: hasWindow=\(anchor.window != nil) raw=\(anchor.convert(anchor.bounds, to: nil)) screen=\(screenFrame) origin=\(origin)", source: "debug")
+            }
         } else if let screen = NSScreen.main {
             let vf = screen.visibleFrame
             origin.x = vf.maxX - contentSize.width - 20
@@ -57,6 +71,7 @@ final class BubbleController {
 
         hideTimer?.invalidate()
         hideTimer = Timer.scheduledTimer(withTimeInterval: ttl, repeats: false) { [weak self] _ in
+            LogStore.shared.append("bubble-auto-dismiss", source: "desktop")
             self?.dismiss()
         }
         if let hideTimer { RunLoop.main.add(hideTimer, forMode: .common) }
@@ -109,8 +124,11 @@ final class BubbleController {
 
         // Full-surface click backdrop (opens the panel); action buttons sit
         // above it and receive their own clicks.
-        let backdrop = NSButton(title: "", target: self, action: #selector(bubbleClicked))
-        backdrop.isBordered = false
+        let backdrop = BubbleBackdropView()
+        backdrop.onClick = { [weak self] in
+            LogStore.shared.append("bubble-clicked", source: "desktop")
+            self?.bubbleClicked()
+        }
         backdrop.translatesAutoresizingMaskIntoConstraints = false
 
         let titleLabel = NSTextField(labelWithString: title)
@@ -183,5 +201,14 @@ final class BubbleController {
         let handler = clickHandler
         dismiss()
         handler?()
+    }
+}
+
+
+/// Plain NSView that reliably receives clicks anywhere on the bubble surface.
+final class BubbleBackdropView: NSView {
+    var onClick: (() -> Void)?
+    override func mouseDown(with event: NSEvent) {
+        onClick?()
     }
 }

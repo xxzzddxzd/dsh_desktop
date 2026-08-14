@@ -47,6 +47,8 @@ struct StatusEvent {
     let kind: Kind
     let text: String
     let at: TimeInterval
+    var sessionId: String = ""
+    var title: String = ""
 }
 
 /// Transient status events stay visible for this long.
@@ -69,6 +71,8 @@ struct SessionState {
     var waitingKind: String = ""   // "question" | "approval"
     var waitingSince: TimeInterval = 0
     var lastError: String?
+    var lastActivityAt: TimeInterval = 0
+    var lastUserMessageAt: TimeInterval = 0
     var busySince: TimeInterval?
     var busyStartSteps: Int = 0
     var tokenOutput: Int = 0
@@ -93,6 +97,10 @@ struct Snapshot {
     var sessions: [SessionState] = []
     var activeJobs = 0
     var statusEvent: StatusEvent?
+    var queuedEvents: Int = 0
+    /// Session id → workspace title (mirrors the web UI's workspace view).
+    var workspaceTitles: [String: String] = [:]
+    var archivedSessionIds: Set<String> = []
 
     var waitingSessions: [SessionState] { sessions.filter { $0.waitingForUser } }
     var runningSessions: [SessionState] { sessions.filter { $0.running } }
@@ -125,11 +133,45 @@ final class AppState {
     private var notifyPending = false
     private var lastGoalNotification = ""
     private var transientEvent: StatusEvent?
+    private var muxConnectedAt: TimeInterval = 0
+    private var lastMuxFrameAt: TimeInterval = 0
+    private struct WorkspaceInfo {
+        var title: String
+        var sessionIds: [String]
+    }
+    private var workspaces: [String: WorkspaceInfo] = [:]
+    private var archivedSessionIds: Set<String> = []
+
+    /// workspace.list: the authoritative workspace membership the web UI uses.
+    func ingestWorkspaceList(_ dict: [String: Any]) {
+        queue.async { [self] in
+            if let items = dict["items"] as? [[String: Any]] {
+                for item in items {
+                    guard let id = item["workspaceId"] as? String else { continue }
+                    workspaces[id] = WorkspaceInfo(
+                        title: item["title"] as? String ?? "",
+                        sessionIds: item["sessionIds"] as? [String] ?? [])
+                }
+            }
+            if let arch = dict["archivedSessionIds"] as? [String] {
+                archivedSessionIds = Set(arch)
+            }
+            publish()
+        }
+    }
+
+    /// Sessions the user recently viewed in ANY client (web UI or our panel):
+    /// the server broadcasts session/subscribed for those, so the completion
+    /// queue can stay backend-authoritative.
+    private var recentlyViewedAt: [String: TimeInterval] = [:]
+    /// Clickable completion queue: the front shows in the bar until the user
+    /// clicks it (then the next one surfaces).
+    private var eventQueue: [StatusEvent] = []
 
     /// Fired on the main thread whenever state changes.
     var onChange: (() -> Void)?
     /// Fired on the main thread when a bubble should pop under the menu bar.
-    var onBubble: ((String, String) -> Void)?
+    var onBubble: ((String, String, String) -> Void)?
     /// Fired on the main thread when an approval can be answered from a bubble.
     var onApproval: ((ApprovalInfo) -> Void)?
     /// Fired on the main thread when an approval resolved (bubble can dismiss).
@@ -191,9 +233,19 @@ final class AppState {
         }
     }
 
+    /// Called once when the mux stream (re)starts, so the connection's
+    /// bootstrap auto-subscribe frames can be told apart from real views.
+    func noteMuxConnected() {
+        queue.async { [self] in
+            muxConnectedAt = Date().timeIntervalSince1970
+        }
+    }
+
     func ingestMuxFrame(_ payload: [String: Any], rpcId: String = "") {
         queue.async { [self] in
-            applyMuxFrame(payload, rpcId: rpcId)
+            let prevFrameAt = lastMuxFrameAt
+            lastMuxFrameAt = Date().timeIntervalSince1970
+            applyMuxFrame(payload, rpcId: rpcId, prevFrameAt: prevFrameAt)
             publish()
         }
     }
@@ -222,8 +274,23 @@ final class AppState {
             guard let id = payload["sessionId"] as? String,
                   let running = payload["running"] as? Bool else { return }
             var s = sessions[id] ?? SessionState(id: id)
-            handleRunningTransition(&s, running: running)
+            handleRunningTransition(&s, running: running, source: "ws-status")
             sessions[id] = s
+        case "host/workspace-changed":
+            if let w = payload["workspace"] as? [String: Any],
+               let id = w["workspaceId"] as? String {
+                workspaces[id] = WorkspaceInfo(
+                    title: w["title"] as? String ?? "",
+                    sessionIds: w["sessionIds"] as? [String] ?? [])
+            }
+        case "host/workspace-removed":
+            if let id = payload["workspaceId"] as? String {
+                workspaces.removeValue(forKey: id)
+            }
+        case "host/archived-sessions-changed":
+            if let ids = payload["archivedSessionIds"] as? [String] {
+                archivedSessionIds = Set(ids)
+            }
         case "host/agent-error":
             guard let id = payload["sessionId"] as? String else { return }
             var s = sessions[id] ?? SessionState(id: id)
@@ -238,7 +305,7 @@ final class AppState {
         }
     }
 
-    private func applyMuxFrame(_ payload: [String: Any], rpcId: String = "") {
+    private func applyMuxFrame(_ payload: [String: Any], rpcId: String = "", prevFrameAt: TimeInterval = 0) {
         guard let type = payload["type"] as? String else { return }
         let sid = payload["sessionId"] as? String ?? ""
 
@@ -246,6 +313,17 @@ final class AppState {
         case "session/subscribed":
             guard !sid.isEmpty else { return }
             if sessions[sid] == nil { sessions[sid] = SessionState(id: sid) }
+            // The server broadcasts a subscribed baseline for the most
+            // recent session when a NEW connection attaches. Ignore those
+            // bootstrap frames; every other subscribed frame means some
+            // client (e.g. Safari with this session open) is now viewing
+            // the session — treat it as read.
+            let now = Date().timeIntervalSince1970
+            let isBootstrap = (muxConnectedAt > 0 && now - muxConnectedAt < 5)
+                || (prevFrameAt == 0 || now - prevFrameAt > 5)
+            if !isBootstrap {
+                noteUserEngagement(sid)
+            }
         case "session/event":
             guard !sid.isEmpty,
                   let event = payload["event"] as? [String: Any],
@@ -290,8 +368,9 @@ final class AppState {
             sessions[sid] = s
             if Settings.shared.wantsBubble {
                 let reason = truncate(s.waitingReason, limit: 140)
+                let sid = s.id
                 DispatchQueue.main.async { [weak self] in
-                    self?.onBubble?("需要你的回答", reason)
+                    self?.onBubble?("需要你的回答", reason, sid)
                 }
             }
             if Settings.shared.wantsNotification,
@@ -343,6 +422,52 @@ final class AppState {
         }
     }
 
+    /// Genuine agent activity: refresh the activity clock and start the busy
+    /// timer if it is not already running. The `running` flag itself is
+    /// NEVER set here — it belongs to the server's authoritative frames.
+    /// Late mux stragglers that land after the server already said
+    /// running=false must not resurrect the swim or a bogus busy clock.
+    private func markActivity(_ s: inout SessionState) {
+        let now = Date().timeIntervalSince1970
+        s.lastActivityAt = now
+        guard s.running else { return }
+        if s.busySince == nil {
+            s.busySince = now
+            s.busyStartSteps = s.steps
+            s.lastAssistantText = ""
+        }
+        // Throttled persistence: a mid-turn relaunch (e.g. an app update)
+        // resumes the busy clock instead of truncating the turn.
+        persistBusySince(s)
+    }
+
+    private func persistBusySince(_ s: SessionState) {
+        guard let since = s.busySince else { return }
+        let now = Date().timeIntervalSince1970
+        let key = "busySince.\(s.id)"
+        if now - UserDefaults.standard.double(forKey: key + ".w") > 30 {
+            UserDefaults.standard.set(since, forKey: key)
+            UserDefaults.standard.set(now, forKey: key + ".w")
+        }
+    }
+
+    /// Resume a busy clock that a recent relaunch interrupted (<=90s old).
+    private func restoreBusySince(_ s: inout SessionState) {
+        guard s.busySince == nil, s.running else { return }
+        let key = "busySince.\(s.id)"
+        let since = UserDefaults.standard.double(forKey: key)
+        let now = Date().timeIntervalSince1970
+        if since > 0, now - since <= 90 {
+            s.busySince = since
+            s.busyStartSteps = 0
+        }
+    }
+
+    private func clearPersistedBusySince(_ id: String) {
+        UserDefaults.standard.removeObject(forKey: "busySince.\(id)")
+        UserDefaults.standard.removeObject(forKey: "busySince.\(id).w")
+    }
+
     /// The agent resumed or answered: it is no longer waiting for the user.
     private func clearWaiting(_ s: inout SessionState) {
         s.waitingForUser = false
@@ -353,8 +478,14 @@ final class AppState {
 
     private func applySessionEvent(_ type: String, data: Any?, to s: inout SessionState) {
         switch type {
+        case "user/message":
+            // The user sent a prompt in this session: they are right there,
+            // so any completion prompt for it is stale.
+            s.lastUserMessageAt = Date().timeIntervalSince1970
+            noteUserEngagement(s.id)
         case "step/start", "step/end":
             if let dict = data as? [String: Any], let step = dict["step"] as? Int { s.steps = step }
+            markActivity(&s)
         case "goal/change":
             applyGoalChange(data as? [String: Any], to: &s)
         case "todo/write":
@@ -366,8 +497,7 @@ final class AppState {
                 updateTodos(parseTodos(list), in: &s)
             }
         case "assistant/message":
-            s.running = true
-            if s.busySince == nil { s.busySince = Date().timeIntervalSince1970 }
+            markActivity(&s)
             // Capture the assistant's text for the turn-end brief.
             if let dict = data as? [String: Any],
                let message = dict["message"] as? [String: Any],
@@ -386,8 +516,7 @@ final class AppState {
             // user" state from a missed resolution frame is over.
             clearWaiting(&s)
         case "tool/call", "tool/result", "assistant/chunk":
-            s.running = true
-            if s.busySince == nil { s.busySince = Date().timeIntervalSince1970 }
+            markActivity(&s)
             clearWaiting(&s)
         default:
             break
@@ -422,8 +551,9 @@ final class AppState {
     private func applySummary(_ item: [String: Any], to s: inout SessionState) {
         if let t = item["updatedAt"] as? Double { s.updatedAt = max(s.updatedAt, t / 1000) }
         if let running = item["running"] as? Bool {
-            handleRunningTransition(&s, running: running)
+            handleRunningTransition(&s, running: running, source: "poll")
         }
+        restoreBusySince(&s)
         s.blank = item["blank"] as? Bool ?? false
         if let cwd = item["cwd"] as? String { s.cwd = cwd }
         if let projections = item["projections"] as? [String: Any],
@@ -441,20 +571,26 @@ final class AppState {
         }
     }
 
-    private func handleRunningTransition(_ s: inout SessionState, running: Bool) {
+    private func handleRunningTransition(_ s: inout SessionState, running: Bool, source: String = "?") {
         let now = Date().timeIntervalSince1970
         if running {
-            s.running = true
-            if s.busySince == nil {
-                s.busySince = now
-                s.busyStartSteps = s.steps
-                s.lastAssistantText = ""
+            // NOTE: busySince is deliberately NOT set here. Only genuine
+            // activity events (assistant messages, tool calls, steps) start
+            // the busy clock — a bare running=true claim with no activity
+            // must never produce completion alerts.
+            if s.running != running {
+                LogStore.shared.append("run: \(s.id.prefix(8)) -> true [\(source)]", source: "desktop")
             }
+            s.running = true
             // Resuming after an answer/approval: the wait is over.
             if s.waitingForUser { clearWaiting(&s) }
         } else {
             let wasRunning = s.running
+            if wasRunning != running {
+                LogStore.shared.append("run: \(s.id.prefix(8)) -> false [\(source)]", source: "desktop")
+            }
             s.running = false
+            clearPersistedBusySince(s.id)
             if wasRunning, let since = s.busySince {
                 let duration = now - since
                 s.busySince = nil
@@ -463,16 +599,24 @@ final class AppState {
                 s.lastTurnOutput = s.tokenOutput
                 s.busyStartSteps = 0
 
-                if duration >= 3, now - s.lastTurnEventAt > 20 {
+                // If the user messaged this session within the last 5
+                // minutes they are actively watching it — the completion is
+                // self-evident and must not prompt anywhere.
+                let engaged = s.lastUserMessageAt > 0 && now - s.lastUserMessageAt < 300
+
+                // Turns under 8s are not worth a queue entry.
+                if duration >= 8, !engaged, now - s.lastTurnEventAt > 20 {
                     s.lastTurnEventAt = now
                     let name = s.title.isEmpty ? "会话" : s.title
-                    setTransient(.turnDone, text: "完成 \(truncate(name, limit: 12))")
+                    enqueueEvent(.turnDone, sessionId: s.id, title: s.title,
+                                 text: "完成 \(truncate(name, limit: 12))")
                 }
 
                 // Task completion: bubble with a brief (steps / tokens /
                 // duration + the assistant's closing words). Fires eagerly
                 // (>=5s) so it tracks the status bar, never lags a turn.
-                if duration >= 5, now - s.lastTurnBubbleAt > 30, Settings.shared.wantsBubble {
+                // Bubbles for real work (>=20s).
+                if duration >= 20, !engaged, now - s.lastTurnBubbleAt > 30, Settings.shared.wantsBubble {
                     s.lastTurnBubbleAt = now
                     var parts: [String] = []
                     if stepsDelta > 0 { parts.append("步骤 \(stepsDelta)") }
@@ -483,14 +627,15 @@ final class AppState {
                         brief += "\n" + s.lastAssistantText
                     }
                     let name = s.title.isEmpty ? "会话" : truncate(s.title, limit: 16)
+                    let sid = s.id
                     LogStore.shared.append("bubble: turn-done · \(name) · \(parts.joined(separator: " · "))", source: "desktop")
                     DispatchQueue.main.async { [weak self] in
-                        self?.onBubble?("任务完成 · \(name)", brief)
+                        self?.onBubble?("任务完成 · \(name)", brief, sid)
                     }
                 }
 
                 let coolDown = now - s.lastTurnDoneAt
-                if duration >= 10, coolDown > 60,
+                if duration >= 20, !engaged, coolDown > 60,
                    Settings.shared.wantsNotification,
                    Settings.shared.notifyTurnDone, Settings.shared.notificationsEnabled {
                     s.lastTurnDoneAt = now
@@ -529,7 +674,7 @@ final class AppState {
                 lastGoalNotification = key
                 switch goal.phase {
                 case "complete":
-                    setTransient(.goalComplete, text: "目标完成")
+                    enqueueEvent(.goalComplete, sessionId: s.id, title: s.title, text: "目标完成")
                     if Settings.shared.wantsNotification {
                         Notifier.shared.notify(id: "goal-complete-\(s.id)", title: "DSH 目标完成",
                                                body: "「\(truncate(goal.objective, limit: 80))」已完成。")
@@ -537,9 +682,10 @@ final class AppState {
                     if Settings.shared.wantsBubble, key != s.lastGoalBubbleKey {
                         s.lastGoalBubbleKey = key
                         let objective = truncate(goal.objective, limit: 90)
+                        let sid = s.id
                         LogStore.shared.append("bubble: goal-complete · \(objective)", source: "desktop")
                         DispatchQueue.main.async { [weak self] in
-                            self?.onBubble?("目标完成", objective)
+                            self?.onBubble?("目标完成", objective, sid)
                         }
                     }
                 default:
@@ -572,8 +718,9 @@ final class AppState {
             }
             if Settings.shared.wantsBubble {
                 LogStore.shared.append("bubble: blocked · \(truncate(reason, limit: 60))", source: "desktop")
+                let sid = s.id
                 DispatchQueue.main.async { [weak self] in
-                    self?.onBubble?("目标已阻塞", reason)
+                    self?.onBubble?("目标已阻塞", reason, sid)
                 }
             }
         } else {
@@ -624,11 +771,12 @@ final class AppState {
         }
         if let first = newlyCompleted.first {
             let extra = newlyCompleted.count > 1 ? " +\(newlyCompleted.count - 1)" : ""
-            setTransient(.completed, text: "完成 \(truncate(first.content, limit: 14))\(extra)")
+            enqueueEvent(.completed, sessionId: s.id, title: s.title,
+                         text: "完成 \(truncate(first.content, limit: 14))\(extra)")
         }
     }
 
-    /// Queue a transient status event; it expires after statusEventTtl.
+    /// Short-lived status flash (blocked / failed alerts, not clickable).
     private func setTransient(_ kind: StatusEvent.Kind, text: String) {
         let event = StatusEvent(kind: kind, text: text, at: Date().timeIntervalSince1970)
         transientEvent = event
@@ -636,6 +784,44 @@ final class AppState {
             self?.queue.async {
                 self?.publish()
             }
+        }
+    }
+
+    /// The user engaged a session (opened it in any client, or sent a
+    /// message in it): its completion prompts are stale — dequeue them.
+    private func noteUserEngagement(_ sid: String) {
+        guard !sid.isEmpty else { return }
+        let now = Date().timeIntervalSince1970
+        recentlyViewedAt[sid] = now
+        let removed = eventQueue.filter { $0.sessionId == sid }.count
+        if removed > 0 {
+            eventQueue.removeAll { $0.sessionId == sid }
+            LogStore.shared.append("viewed: \(sid.prefix(8)) → 出队 \(removed) 条完成提示", source: "desktop")
+        }
+    }
+
+    /// Queue a clickable completion event: it stays in the bar until the
+    /// user clicks it (opening that session), then the next one surfaces.
+    private func enqueueEvent(_ kind: StatusEvent.Kind, sessionId: String, title: String, text: String) {
+        // The user already saw this session elsewhere: no stale prompt.
+        let now = Date().timeIntervalSince1970
+        if let viewedAt = recentlyViewedAt[sessionId], now - viewedAt < 90 {
+            return
+        }
+        var event = StatusEvent(kind: kind, text: text, at: now)
+        event.sessionId = sessionId
+        event.title = title
+        eventQueue.append(event)
+        if eventQueue.count > 5 { eventQueue.removeFirst(eventQueue.count - 5) }
+    }
+
+    /// The user clicked the front event: drop it and surface the next.
+    func consumeFrontEvent() {
+        queue.async { [self] in
+            if !eventQueue.isEmpty {
+                eventQueue.removeFirst()
+            }
+            publish()
         }
     }
 
@@ -651,6 +837,7 @@ final class AppState {
     }
 
     private func buildSnapshotLocked() -> Snapshot {
+        let nowNow = Date().timeIntervalSince1970
         var snap = Snapshot()
         snap.serverRunning = serverRunning
         snap.serverOwned = serverOwned
@@ -662,8 +849,33 @@ final class AppState {
         snap.serverError = serverError
         snap.sessions = sessions.values.sorted { $0.updatedAt > $1.updatedAt }
         snap.activeJobs = sessions.values.reduce(0) { $0 + $1.jobs.filter(\.isActive).count }
-        if let ev = transientEvent, Date().timeIntervalSince1970 - ev.at < statusEventTtl {
+        // Completion queue: front surfaces; entries expire after 10 minutes.
+        while let front = eventQueue.first, nowNow - front.at > 600 {
+            eventQueue.removeFirst()
+        }
+        snap.queuedEvents = eventQueue.count
+        snap.archivedSessionIds = archivedSessionIds
+        for w in workspaces.values {
+            for sid in w.sessionIds {
+                if snap.workspaceTitles[sid] == nil {
+                    snap.workspaceTitles[sid] = w.title
+                }
+            }
+        }
+        if let ev = eventQueue.first {
             snap.statusEvent = ev
+        } else if let ev = transientEvent, nowNow - ev.at < statusEventTtl {
+            snap.statusEvent = ev
+        }
+        for (key, at) in recentlyViewedAt where nowNow - at > 90 {
+            recentlyViewedAt.removeValue(forKey: key)
+        }
+        // A running flag with no recent activity is a phantom (idle session):
+        // render it as idle so the bar doesn't swim forever.
+        for key in sessions.keys {
+            guard let s = sessions[key], s.running, s.lastActivityAt > 0,
+                  nowNow - s.lastActivityAt > 300 else { continue }
+            sessions[key]?.running = false
         }
         // Hard expiry: a waiting flag that survives 10 minutes with no
         // resolution frame is stale (missed frame / WS gap) — drop it.

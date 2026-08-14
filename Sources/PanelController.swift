@@ -217,6 +217,8 @@ final class PanelController: NSObject, NSPopoverDelegate, WKNavigationDelegate, 
     var onOpenSettings: (() -> Void)?
     var onQuit: (() -> Void)?
     var onDismiss: (() -> Void)?
+    /// Fired right after the popover becomes visible.
+    var onPopoverShown: (() -> Void)?
 
     override init() {
         super.init()
@@ -290,6 +292,9 @@ final class PanelController: NSObject, NSPopoverDelegate, WKNavigationDelegate, 
         }
         panelVC.setGripHidden(false)
         ensureWebView()
+        // Freeze the status item width BEFORE showing so the popover opens
+        // anchored at the final frame (no jump at open, none while open).
+        onPopoverShown?()
         popover.show(relativeTo: button.bounds, of: button, preferredEdge: .minY)
         NSApp.activate(ignoringOtherApps: true)
     }

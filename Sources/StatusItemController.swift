@@ -66,7 +66,9 @@ enum StatusText {
             lines.append("服务器：离线" + (snap.serverError.isEmpty ? "" : "（\(snap.serverError)）"))
         }
 
-        let show = Array(snap.sessions.prefix(6))
+        let show = Array(snap.sessions
+            .filter { !snap.archivedSessionIds.contains($0.id) }
+            .prefix(6))
         if show.isEmpty {
             lines.append("暂无会话")
         } else {
@@ -75,6 +77,9 @@ enum StatusText {
             }
         }
         lines.append("")
+        if snap.queuedEvents > 0 {
+            lines.append("还有 \(snap.queuedEvents) 条完成提示：点击状态栏逐条打开对应会话")
+        }
         lines.append("左键：打开面板 · 右键：菜单 · ⌃⌥D：全局唤起")
         return lines.joined(separator: "\n")
     }
@@ -143,8 +148,19 @@ final class StatusItemController {
     private var ringProgress: Double = 0
     private var forcedRunningUntil: TimeInterval = 0
 
-    /// Swim path (built once): right → left → right; the head always leads.
-    private var swimFrames: [(x: CGFloat, movingLeft: Bool)] = []
+    /// Swim frame: horizontal center x + horizontal scale p (p = 1 faces
+    /// left = original; p = -1 mirrored). |p| shrinks through 0 at the
+    /// turn-around for a squash-and-turn, so the flip reads as a motion.
+    private struct SwimFrame {
+        let x: CGFloat
+        let p: CGFloat
+    }
+    /// Swim path (built once): 40pt travel, smooth turns at both ends.
+    private var swimFrames: [SwimFrame] = []
+    /// Number of small trailing whales currently rendered.
+    private var currentSmallCount = 0
+    /// Fleet size forced by the demo (survives state refreshes).
+    private var forcedSmallCount = 0
     /// Progress-ring arc breathing (alpha only).
     private let arcAlphas: [CGFloat] = [0.92, 0.80, 0.66, 0.56, 0.66, 0.80]
 
@@ -153,10 +169,14 @@ final class StatusItemController {
 
     init() {
         item = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
-        var frames: [(CGFloat, Bool)] = []
-        var x: CGFloat = 16
-        while x < 30.5 { frames.append((x, false)); x += 2 }
-        while x > 15.5 { frames.append((x, true)); x -= 2 }
+        let xMin: CGFloat = 8
+        let xMax: CGFloat = 48
+        var frames: [SwimFrame] = []
+        var x = xMin
+        while x < xMax + 0.5 { frames.append(SwimFrame(x: x, p: -1)); x += 2 }   // heading right
+        for p: CGFloat in [-0.6, -0.25, 0.0, 0.25, 0.6] { frames.append(SwimFrame(x: xMax, p: p)) }
+        while x > xMin - 0.5 { frames.append(SwimFrame(x: x, p: 1)); x -= 2 }    // heading left
+        for p: CGFloat in [0.6, 0.25, 0.0, -0.25, -0.6] { frames.append(SwimFrame(x: xMin, p: p)) }
         swimFrames = frames
         if let button = item.button {
             button.image = Self.staticIcon()
@@ -169,6 +189,24 @@ final class StatusItemController {
     }
 
     var button: NSStatusBarButton? { item.button }
+
+    /// While the panel is open, pin the status item to a fixed width so the
+    /// popover anchor never moves (no re-positioning jumps).
+    func freezeForPanel() {
+        guard !frozen else { return }
+        frozen = true
+        let current: CGFloat = item.button?.frame.width ?? 46
+        item.length = max(current, 112)
+    }
+
+    func unfreezeForPanel() {
+        guard frozen else { return }
+        frozen = false
+        item.length = NSStatusItem.variableLength
+        render(AppState.shared.snapshot())
+    }
+
+    private var frozen = false
 
     func render(_ snap: Snapshot) {
         let (text, color) = StatusText.mainText(snap)
@@ -187,8 +225,9 @@ final class StatusItemController {
     /// Force the swimming whale for a few seconds regardless of real state.
     func demoRunning(seconds: TimeInterval = 15) {
         forcedRunningUntil = Date().timeIntervalSince1970 + seconds
+        forcedSmallCount = 2
         stopRing()
-        startSwim()
+        startSwim(smallCount: forcedSmallCount)
         DispatchQueue.main.asyncAfter(deadline: .now() + seconds + 0.2) { [weak self] in
             self?.render(AppState.shared.snapshot())
         }
@@ -224,7 +263,12 @@ final class StatusItemController {
         let forced = forcedRunningUntil > Date().timeIntervalSince1970
         if forced || !snap.runningSessions.isEmpty {
             stopRing()
-            startSwim()
+            if forced {
+                startSwim(smallCount: forcedSmallCount)
+            } else {
+                let count = snap.runningSessions.count
+                startSwim(smallCount: min(max(count - 1, 0), 3))
+            }
             return
         }
         stopSwim()
@@ -232,14 +276,28 @@ final class StatusItemController {
         item.button?.image = Self.staticIcon()
     }
 
-    private func startSwim() {
-        guard animTimer == nil else { return }
+    private func startSwim(smallCount: Int) {
+        if animTimer != nil, currentSmallCount == smallCount { return }
+        animTimer?.invalidate()
+        currentSmallCount = smallCount
         frameIndex = 0
-        animTimer = Timer.scheduledTimer(withTimeInterval: 0.09, repeats: true) { [weak self] _ in
+        animTimer = Timer.scheduledTimer(withTimeInterval: 0.07, repeats: true) { [weak self] _ in
             guard let self else { return }
-            let frame = self.swimFrames[self.frameIndex % self.swimFrames.count]
+            let total = self.swimFrames.count
+            let f = self.frameIndex % total
             self.frameIndex += 1
-            self.item.button?.image = Self.swimIcon(centerX: frame.x, movingLeft: frame.movingLeft)
+            let main = self.swimFrames[f]
+            // Each follower rides its own frame (8-frame lag per member):
+            // it keeps swimming until IT reaches the lane end, then turns.
+            var members: [(x: CGFloat, p: CGFloat)] = []
+            for i in 0..<self.currentSmallCount {
+                let lag = 8 * (i + 1)
+                let m = self.swimFrames[(f - lag + total) % total]
+                members.append((x: m.x, p: m.p))
+            }
+            self.item.button?.image = Self.swimIcon(centerX: main.x,
+                                                    p: main.p,
+                                                    members: members)
         }
         if let animTimer { RunLoop.main.add(animTimer, forMode: .common) }
     }
@@ -269,9 +327,8 @@ final class StatusItemController {
 
     // MARK: - Icon drawing (all template images: adaptive, transparent bg)
 
-    private static func drawWhale(in rect: NSRect, alpha: CGFloat = 1, flipped: Bool = false) {
-        guard let whalePath = Bundle.main.path(forResource: "StatusIcon", ofType: "svg"),
-              let whale = NSImage(contentsOfFile: whalePath) else {
+    private static func drawWhale(in rect: NSRect, alpha: CGFloat = 1, xScale: CGFloat = 1) {
+        guard let whale = WhaleIcon.image() else {
             // Fallback: letter D.
             let attrs: [NSAttributedString.Key: Any] = [
                 .font: NSFont.systemFont(ofSize: 11, weight: .bold),
@@ -290,12 +347,17 @@ final class StatusItemController {
         }
         ctx.saveGState()
         ctx.setAlpha(alpha)
-        if flipped {
-            // Mirror about the rect's vertical center line.
-            ctx.translateBy(x: rect.midX * 2, y: 0)
-            ctx.scaleBy(x: -1, y: 1)
+        if xScale != 1 {
+            // Scale about the rect center; negative p mirrors horizontally,
+            // small |p| squashes toward edge-on for the turn animation.
+            ctx.translateBy(x: rect.midX, y: rect.midY)
+            ctx.scaleBy(x: xScale, y: 1)
+            let half = NSSize(width: rect.width / 2, height: rect.height / 2)
+            whale.draw(in: NSRect(x: -half.width, y: -half.height,
+                                  width: rect.width, height: rect.height))
+        } else {
+            whale.draw(in: rect)
         }
-        whale.draw(in: rect)
         ctx.restoreGState()
     }
 
@@ -316,21 +378,26 @@ final class StatusItemController {
         }
     }
 
-    /// Busy: whale swimming at centerX with a fading dot trail behind it.
-    static func swimIcon(centerX: CGFloat, movingLeft: Bool) -> NSImage {
-        templateImage(size: NSSize(width: 46, height: 18)) {
-            // Dots trail behind (opposite of the heading).
-            let behind: CGFloat = movingLeft ? 1 : -1
-            let alphas: [CGFloat] = [0.65, 0.45, 0.25]
-            for (i, alpha) in alphas.enumerated() {
-                let dx = behind * CGFloat(5 + i * 4)
-                let dot = NSRect(x: centerX + dx - 1.3, y: 8.2, width: 2.6, height: 2.6)
-                NSColor.black.withAlphaComponent(alpha).setFill()
-                NSBezierPath(ovalIn: dot).fill()
+    /// Canvas width: the lane (8→48) plus whale edges; every fish shares
+    /// the same lane, so the width is constant regardless of fleet size.
+    static func swimCanvasWidth(smallCount: Int) -> CGFloat {
+        58
+    }
+
+    /// Busy: the leader whale swims across a 40pt range; each follower rides
+    /// the same lane on its own lagged frame — it reaches the lane end and
+    /// turns there, not mid-lane.
+    static func swimIcon(centerX: CGFloat, p: CGFloat, members: [(x: CGFloat, p: CGFloat)]) -> NSImage {
+        templateImage(size: NSSize(width: 58, height: 18)) {
+            let smallAlphas: [CGFloat] = [0.78, 0.58, 0.42]
+            for (i, m) in members.enumerated() {
+                let alpha = smallAlphas[min(i, smallAlphas.count - 1)]
+                drawWhale(in: NSRect(x: m.x - 6, y: 3, width: 12, height: 12),
+                          alpha: alpha, xScale: m.p)
             }
-            // Head leads the motion (the official whale faces left).
-            drawWhale(in: NSRect(x: centerX - 7, y: 2, width: 14, height: 14),
-                      flipped: !movingLeft)
+            // Leader: 16pt whale, head leads the motion.
+            drawWhale(in: NSRect(x: centerX - 8, y: 1, width: 16, height: 16),
+                      xScale: p)
         }
     }
 

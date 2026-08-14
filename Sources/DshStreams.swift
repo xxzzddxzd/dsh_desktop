@@ -11,6 +11,7 @@ final class DshStreams: NSObject {
     private var muxBackoff: TimeInterval = 1
     private var hostConnected = false
     private var muxConnected = false
+    private var framesLogged: [String: Int] = [:]
     private var closed = false
     private var port: Int
 
@@ -56,6 +57,7 @@ final class DshStreams: NSObject {
 
     private func connect(kind: String, path: String) {
         guard let url = URL(string: "ws://127.0.0.1:\(port)\(path)") else { return }
+        LogStore.shared.append("ws-connect: \(kind)", source: "desktop")
         let task = session.webSocketTask(with: url)
         if kind == "host" { hostTask = task } else { muxTask = task }
         task.resume()
@@ -64,8 +66,8 @@ final class DshStreams: NSObject {
     }
 
     private func schedulePing(kind: String, task: URLSessionWebSocketTask) {
-        queue.addOperation { [weak self, weak task] in
-            Thread.sleep(forTimeInterval: 25)
+        // Never block the delegate queue: schedule on a global queue instead.
+        DispatchQueue.global().asyncAfter(deadline: .now() + 25) { [weak self, weak task] in
             guard let self, !self.closed, let task else { return }
             task.sendPing { _ in }
             self.schedulePing(kind: kind, task: task)
@@ -79,6 +81,10 @@ final class DshStreams: NSObject {
             case .success(let message):
                 if kind == "host" { self.hostBackoff = 1; self.hostConnected = true }
                 else { self.muxBackoff = 1; self.muxConnected = true }
+                if self.framesLogged[kind, default: 0] < 2 {
+                    self.framesLogged[kind, default: 0] += 1
+                    LogStore.shared.append("ws-frame: \(kind)", source: "desktop")
+                }
                 switch message {
                 case .string(let text):
                     self.handle(text: text, kind: kind)
@@ -90,7 +96,8 @@ final class DshStreams: NSObject {
                     break
                 }
                 self.receiveLoop(kind: kind, task: task)
-            case .failure:
+            case .failure(let error):
+                LogStore.shared.append("ws-fail: \(kind) \(error.localizedDescription)", source: "desktop")
                 // Connection dropped: exponential backoff reconnect.
                 let delay: TimeInterval
                 if kind == "host" {
@@ -102,10 +109,8 @@ final class DshStreams: NSObject {
                     self.muxBackoff = min(self.muxBackoff * 2, 30)
                     delay = self.muxBackoff
                 }
-                self.queue.addOperation { [weak self] in
+                DispatchQueue.global().asyncAfter(deadline: .now() + delay) { [weak self] in
                     guard let self, !self.closed else { return }
-                    Thread.sleep(forTimeInterval: delay)
-                    guard !self.closed else { return }
                     self.connect(kind: kind, path: kind == "host" ? "/api/events.host" : "/api/events.mux")
                 }
             }

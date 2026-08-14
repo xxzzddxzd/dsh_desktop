@@ -54,8 +54,11 @@ final class MenuController: NSObject, NSMenuDelegate {
         menu.addItem(windowItem)
         menu.addItem(.separator())
 
-        // Live sessions, grouped by project (working directory).
-        let sessions = Array(snap.sessions.prefix(24))
+        // Live sessions, grouped by workspace exactly like the web UI
+        // (archived sessions stay hidden).
+        let sessions = Array(snap.sessions
+            .filter { !snap.archivedSessionIds.contains($0.id) }
+            .prefix(24))
         if sessions.isEmpty {
             let none = NSMenuItem(title: "暂无会话", action: nil, keyEquivalent: "")
             none.isEnabled = false
@@ -148,22 +151,11 @@ final class MenuController: NSObject, NSMenuDelegate {
 
     /// Adds sessions to the menu grouped by project; a single group stays flat.
     private func addSessionGroups(_ sessions: [SessionState], to menu: NSMenu) {
-        // Resolve project keys, disambiguating duplicate basenames with the
-        // parent directory (e.g. /a/foo and /b/foo → "foo (a)" / "foo (b)").
-        var basenameCounts: [String: Int] = [:]
-        for s in sessions {
-            if let base = projectBasename(s.cwd) { basenameCounts[base, default: 0] += 1 }
-        }
+        // Group by the workspace the session belongs to (like the web UI);
+        // sessions without a workspace land in a catch-all group.
+        let titles = AppState.shared.snapshot().workspaceTitles
         func key(for s: SessionState) -> String {
-            if s.cwd.isEmpty { return "其他会话" }
-            if s.cwd == NSHomeDirectory() { return "~" }
-            guard let base = projectBasename(s.cwd) else { return s.cwd }
-            if basenameCounts[base, default: 0] > 1 {
-                let parent = (s.cwd as NSString).deletingLastPathComponent
-                let parentName = (parent as NSString).lastPathComponent
-                return parentName.isEmpty ? base : "\(base)（\(parentName)）"
-            }
-            return base
+            titles[s.id] ?? "其他会话"
         }
 
         var order: [String] = []
@@ -178,11 +170,29 @@ final class MenuController: NSObject, NSMenuDelegate {
             for s in sessions { menu.addItem(sessionItem(s)) }
             return
         }
-        // Flat with group headers: no nested submenus.
+        // Workspace groups stay flat with headers; the catch-all group is a
+        // collapsible submenu.
+        var othersDone = false
         for k in order {
             guard let items = grouped[k], !items.isEmpty else { continue }
+            if k == "其他会话" {
+                othersDone = true
+                let sub = NSMenu(title: k)
+                for s in items { sub.addItem(sessionItem(s)) }
+                let mi = NSMenuItem(title: "\(k)（\(items.count)）", action: nil, keyEquivalent: "")
+                mi.submenu = sub
+                menu.addItem(mi)
+                continue
+            }
             menu.addItem(groupHeader(k, count: items.count))
             for s in items { menu.addItem(sessionItem(s)) }
+        }
+        if !othersDone, let others = grouped["其他会话"], !others.isEmpty {
+            let sub = NSMenu(title: "其他会话")
+            for s in others { sub.addItem(sessionItem(s)) }
+            let mi = NSMenuItem(title: "其他会话（\(others.count)）", action: nil, keyEquivalent: "")
+            mi.submenu = sub
+            menu.addItem(mi)
         }
     }
 
@@ -196,11 +206,6 @@ final class MenuController: NSObject, NSMenuDelegate {
         ], range: NSRange(location: 0, length: text.length))
         header.attributedTitle = text
         return header
-    }
-
-    private func projectBasename(_ cwd: String) -> String? {
-        let base = (cwd as NSString).lastPathComponent
-        return base.isEmpty ? nil : base
     }
 
     private func sessionItem(_ s: SessionState) -> NSMenuItem {
