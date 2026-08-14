@@ -14,20 +14,25 @@ enum StatusText {
             return ("DSH 离线", .secondaryLabelColor)
         }
 
-        // 1. A session is waiting for you — sticky until resolved.
-        if let waiting = snap.waitingSessions.first {
-            let label = waiting.waitingKind == "approval" ? "待审批" : "等你回答"
-            return ("DSH \(label)", .systemBlue)
-        }
-
-        // 2. A recent event is still fresh — flash it.
+        // 1. The queue front shows the session's BRIEF; the counter shows
+        //    how many more sessions are waiting behind it.
         if let ev = snap.statusEvent {
+            let suffix = snap.queuedEvents > 1 ? " (\(snap.queuedEvents))" : ""
             switch ev.kind {
+            case .question, .approval:
+                return (ev.text + suffix, .systemBlue)
             case .completed, .turnDone, .goalComplete:
-                return (ev.text, .systemGreen)
+                return (ev.text + suffix, .systemGreen)
             case .failed, .blocked:
                 return (ev.text, .systemRed)
             }
+        }
+
+        // 2. Fallback for a waiting session whose event frame was missed
+        //    (e.g. the app restarted mid-wait).
+        if let waiting = snap.waitingSessions.first {
+            let label = waiting.waitingKind == "approval" ? "待审批" : "等你回答"
+            return ("DSH \(label)", .systemBlue)
         }
 
         // 3. Fallback glyphs: the whale icon itself carries the activity
@@ -50,37 +55,67 @@ enum StatusText {
     /// Multi-line tooltip for the status item.
     static func tooltip(_ snap: Snapshot) -> String {
         var lines: [String] = []
-        if snap.serverRunning {
-            var serverLine = "服务器：运行中"
-            if !snap.serverVersion.isEmpty { serverLine += " v\(snap.serverVersion)" }
-            if snap.serverService {
-                serverLine += "（launchd 系统服务）"
-            } else {
-                serverLine += "（\(snap.serverOwned ? "本应用托管" : "已挂载外部实例")）"
-            }
-            if !snap.model.isEmpty { serverLine += " · \(snap.provider)/\(snap.model)" }
-            lines.append(serverLine)
-        } else if snap.serverStarting {
-            lines.append("服务器：正在启动…")
-        } else {
-            lines.append("服务器：离线" + (snap.serverError.isEmpty ? "" : "（\(snap.serverError)）"))
+
+        // 1. 当前状态（与状态栏展示一致）
+        let (title, _) = mainText(snap)
+        lines.append(title.isEmpty ? "空闲" : title)
+        if let ev = snap.statusEvent, !ev.sessionId.isEmpty {
+            lines.append("点击状态栏打开该会话")
+        } else if !snap.waitingSessions.isEmpty {
+            lines.append("点击状态栏处理该会话")
         }
 
-        let show = Array(snap.sessions
+        // 2. 运行中的会话
+        let running = snap.runningSessions
             .filter { !snap.archivedSessionIds.contains($0.id) }
-            .prefix(6))
-        if show.isEmpty {
-            lines.append("暂无会话")
-        } else {
-            for s in show {
-                lines.append(sessionLine(s))
+        if !running.isEmpty {
+            lines.append("")
+            lines.append("运行中：")
+            for s in running.prefix(5) {
+                let name = s.title.isEmpty ? shortId(s.id) : s.title
+                var line = "  \(name)"
+                if s.waitingForUser {
+                    line += " · 等待你的回应"
+                } else if let goal = s.goal, goal.phase == "active" {
+                    line += " · 目标进行中"
+                } else if let todos = s.todos, !todos.isEmpty {
+                    let done = todos.filter { $0.status == "completed" }.count
+                    line += " · 待办 \(done)/\(todos.count)"
+                } else if s.steps > 0 {
+                    line += " · 步骤 \(s.steps)"
+                }
+                lines.append(truncate(line, limit: 64))
             }
         }
-        lines.append("")
+
+        // 3. 待处理队列（简报预览）
         if snap.queuedEvents > 0 {
-            lines.append("还有 \(snap.queuedEvents) 条完成提示：点击状态栏逐条打开对应会话")
+            lines.append("")
+            lines.append("待处理（\(snap.queuedEvents)）：")
+            for ev in snap.queuePreview {
+                let name = ev.title.isEmpty ? shortId(ev.sessionId) : ev.title
+                lines.append(truncate("· \(name)：\(ev.text)", limit: 68))
+            }
         }
-        lines.append("左键：打开面板 · 右键：菜单 · ⌃⌥D：全局唤起")
+
+        // 4. 服务与模型
+        lines.append("")
+        if snap.serverRunning {
+            let mode = snap.serverService ? "launchd 服务" : (snap.serverOwned ? "本应用托管" : "外部实例")
+            let version = snap.serverVersion.isEmpty ? "?" : snap.serverVersion
+            lines.append("服务：运行中 v\(version) · \(mode)")
+            if !snap.model.isEmpty {
+                lines.append("模型：\(snap.provider)/\(snap.model)")
+            }
+        } else if snap.serverStarting {
+            lines.append("服务：启动中…")
+        } else {
+            lines.append("服务：离线" + (snap.serverError.isEmpty ? "" : " · \(snap.serverError)"))
+        }
+
+        // 5. 快捷操作
+        lines.append("")
+        lines.append("左键 面板 · 右键 菜单 · ⌃⌥D 唤起")
         return lines.joined(separator: "\n")
     }
 

@@ -41,8 +41,15 @@ struct StatusEvent {
         case completed      // a todo just completed
         case turnDone       // a session finished a turn
         case goalComplete   // goal reached completion
+        case question       // the agent asked the user something
+        case approval       // the agent needs a tool approval
         case failed         // background job failed
         case blocked        // goal became blocked
+    }
+
+    /// Blocking events (question/approval) jump the queue.
+    var isUrgent: Bool {
+        kind == .question || kind == .approval
     }
     let kind: Kind
     let text: String
@@ -98,6 +105,7 @@ struct Snapshot {
     var activeJobs = 0
     var statusEvent: StatusEvent?
     var queuedEvents: Int = 0
+    var queuePreview: [StatusEvent] = []
     /// Session id → workspace title (mirrors the web UI's workspace view).
     var workspaceTitles: [String: String] = [:]
     var archivedSessionIds: Set<String> = []
@@ -366,9 +374,10 @@ final class AppState {
                 s.waitingReason = "需要你的回答"
             }
             sessions[sid] = s
+            enqueueEvent(.question, sessionId: sid, title: s.title,
+                         text: "等你回答 · \(truncate(s.waitingReason, limit: 26))", urgent: true)
             if Settings.shared.wantsBubble {
                 let reason = truncate(s.waitingReason, limit: 140)
-                let sid = s.id
                 DispatchQueue.main.async { [weak self] in
                     self?.onBubble?("需要你的回答", reason, sid)
                 }
@@ -382,6 +391,7 @@ final class AppState {
             guard !sid.isEmpty, var s = sessions[sid] else { return }
             clearWaiting(&s)
             sessions[sid] = s
+            dequeueEvents(for: sid, kind: .question)
         case "approval/requested":
             guard !sid.isEmpty else { return }
             var s = sessions[sid] ?? SessionState(id: sid)
@@ -397,6 +407,8 @@ final class AppState {
                                         rpcId: rpcId,
                                         toolName: tool,
                                         reason: reason)
+            enqueueEvent(.approval, sessionId: sid, title: s.title,
+                         text: "待审批 · \(truncate(tool, limit: 12))\(reason.isEmpty ? "" : "：" + truncate(reason, limit: 14))", urgent: true)
             if Settings.shared.wantsBubble {
                 DispatchQueue.main.async { [weak self] in
                     self?.onApproval?(approval)
@@ -413,6 +425,7 @@ final class AppState {
                 clearWaiting(&s)
                 sessions[sid] = s
             }
+            dequeueEvents(for: sid, kind: .approval)
             let resolvedId = payload["approvalId"] as? String ?? ""
             DispatchQueue.main.async { [weak self] in
                 self?.onApprovalResolved?(resolvedId)
@@ -607,9 +620,11 @@ final class AppState {
                 // Turns under 8s are not worth a queue entry.
                 if duration >= 8, !engaged, now - s.lastTurnEventAt > 20 {
                     s.lastTurnEventAt = now
-                    let name = s.title.isEmpty ? "会话" : s.title
+                    let snippet = s.lastAssistantText.isEmpty
+                        ? (s.title.isEmpty ? "会话" : s.title)
+                        : s.lastAssistantText
                     enqueueEvent(.turnDone, sessionId: s.id, title: s.title,
-                                 text: "完成 \(truncate(name, limit: 12))")
+                                 text: "完成 · \(truncate(snippet, limit: 22))")
                 }
 
                 // Task completion: bubble with a brief (steps / tokens /
@@ -674,7 +689,8 @@ final class AppState {
                 lastGoalNotification = key
                 switch goal.phase {
                 case "complete":
-                    enqueueEvent(.goalComplete, sessionId: s.id, title: s.title, text: "目标完成")
+                    enqueueEvent(.goalComplete, sessionId: s.id, title: s.title,
+                                 text: "目标完成 · \(truncate(goal.objective, limit: 22))")
                     if Settings.shared.wantsNotification {
                         Notifier.shared.notify(id: "goal-complete-\(s.id)", title: "DSH 目标完成",
                                                body: "「\(truncate(goal.objective, limit: 80))」已完成。")
@@ -800,9 +816,9 @@ final class AppState {
         }
     }
 
-    /// Queue a clickable completion event: it stays in the bar until the
-    /// user clicks it (opening that session), then the next one surfaces.
-    private func enqueueEvent(_ kind: StatusEvent.Kind, sessionId: String, title: String, text: String) {
+    /// Queue a clickable event carrying the session's BRIEF (not just its
+    /// title). Urgent events (question/approval) jump ahead of completions.
+    private func enqueueEvent(_ kind: StatusEvent.Kind, sessionId: String, title: String, text: String, urgent: Bool = false) {
         // The user already saw this session elsewhere: no stale prompt.
         let now = Date().timeIntervalSince1970
         if let viewedAt = recentlyViewedAt[sessionId], now - viewedAt < 90 {
@@ -811,8 +827,22 @@ final class AppState {
         var event = StatusEvent(kind: kind, text: text, at: now)
         event.sessionId = sessionId
         event.title = title
-        eventQueue.append(event)
-        if eventQueue.count > 5 { eventQueue.removeFirst(eventQueue.count - 5) }
+        if urgent {
+            let firstNonUrgent = eventQueue.firstIndex { !$0.isUrgent }
+            eventQueue.insert(event, at: firstNonUrgent ?? eventQueue.count)
+        } else {
+            eventQueue.append(event)
+        }
+        if eventQueue.count > 8 { eventQueue.removeFirst(eventQueue.count - 8) }
+    }
+
+    /// Drop queued events for one session (optionally one kind).
+    private func dequeueEvents(for sid: String, kind: StatusEvent.Kind? = nil) {
+        let before = eventQueue.count
+        eventQueue.removeAll { $0.sessionId == sid && (kind == nil || $0.kind == kind) }
+        if eventQueue.count != before {
+            LogStore.shared.append("dequeue: \(sid.prefix(8)) → 剩余 \(eventQueue.count) 条", source: "desktop")
+        }
     }
 
     /// The user clicked the front event: drop it and surface the next.
@@ -821,6 +851,14 @@ final class AppState {
             if !eventQueue.isEmpty {
                 eventQueue.removeFirst()
             }
+            publish()
+        }
+    }
+
+    /// The user clicked a bubble for one session: drop ITS events.
+    func consumeEvents(for sessionId: String) {
+        queue.async { [self] in
+            dequeueEvents(for: sessionId)
             publish()
         }
     }
@@ -854,6 +892,7 @@ final class AppState {
             eventQueue.removeFirst()
         }
         snap.queuedEvents = eventQueue.count
+        snap.queuePreview = Array(eventQueue.prefix(5))
         snap.archivedSessionIds = archivedSessionIds
         for w in workspaces.values {
             for sid in w.sessionIds {

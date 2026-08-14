@@ -31,7 +31,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                     }
                     let title = AppState.shared.snapshot().sessions.first(where: { $0.id == sessionId })?.title ?? ""
                     self.panelCtrl.openSession(id: sessionId, title: title)
-                    AppState.shared.consumeFrontEvent()
+                    AppState.shared.consumeEvents(for: sessionId)
                     if self.panelCtrl.isPopoverShown { self.installDismissMonitors() }
                 } else {
                     self.panelCtrl.togglePopover(relativeTo: button)
