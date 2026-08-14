@@ -191,7 +191,8 @@ final class StatusItemController {
         let p: CGFloat
     }
     /// Swim path (built once): 40pt travel, smooth turns at both ends.
-    private var swimFrames: [SwimFrame] = []
+    private var swimFramesCache: [Int: [SwimFrame]] = [:]
+    private var currentFrames: [SwimFrame] = []
     /// Number of small trailing whales currently rendered.
     private var currentSmallCount = 0
     /// Fleet size forced by the demo (survives state refreshes).
@@ -204,15 +205,6 @@ final class StatusItemController {
 
     init() {
         item = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
-        let xMin: CGFloat = 8
-        let xMax: CGFloat = 48
-        var frames: [SwimFrame] = []
-        var x = xMin
-        while x < xMax + 0.5 { frames.append(SwimFrame(x: x, p: -1)); x += 2 }   // heading right
-        for p: CGFloat in [-0.6, -0.25, 0.0, 0.25, 0.6] { frames.append(SwimFrame(x: xMax, p: p)) }
-        while x > xMin - 0.5 { frames.append(SwimFrame(x: x, p: 1)); x -= 2 }    // heading left
-        for p: CGFloat in [0.6, 0.25, 0.0, -0.25, -0.6] { frames.append(SwimFrame(x: xMin, p: p)) }
-        swimFrames = frames
         if let button = item.button {
             button.image = Self.staticIcon()
             button.imagePosition = .imageLeading
@@ -231,7 +223,7 @@ final class StatusItemController {
         guard !frozen else { return }
         frozen = true
         let current: CGFloat = item.button?.frame.width ?? 46
-        item.length = max(current, 112)
+        item.length = max(current, 240)
     }
 
     func unfreezeForPanel() {
@@ -302,7 +294,7 @@ final class StatusItemController {
                 startSwim(smallCount: forcedSmallCount)
             } else {
                 let count = snap.runningSessions.count
-                startSwim(smallCount: min(max(count - 1, 0), 3))
+                startSwim(smallCount: min(max(count - 1, 0), 19))
             }
             return
         }
@@ -311,23 +303,41 @@ final class StatusItemController {
         item.button?.image = Self.staticIcon()
     }
 
+    /// Swim frames for a fleet of this size (cached per follower count):
+    /// the lane grows 16pt per follower so bigger fleets never crowd.
+    private func frames(for smallCount: Int) -> [SwimFrame] {
+        let n = min(smallCount, 19)
+        if let cached = swimFramesCache[n] { return cached }
+        let xMin: CGFloat = 8
+        let xMax: CGFloat = 48 + 16 * CGFloat(n)
+        var frames: [SwimFrame] = []
+        var x = xMin
+        while x < xMax + 0.5 { frames.append(SwimFrame(x: x, p: -1)); x += 2 }
+        for p: CGFloat in [-0.6, -0.25, 0.0, 0.25, 0.6] { frames.append(SwimFrame(x: xMax, p: p)) }
+        while x > xMin - 0.5 { frames.append(SwimFrame(x: x, p: 1)); x -= 2 }
+        for p: CGFloat in [0.6, 0.25, 0.0, -0.25, -0.6] { frames.append(SwimFrame(x: xMin, p: p)) }
+        swimFramesCache[n] = frames
+        return frames
+    }
+
     private func startSwim(smallCount: Int) {
         if animTimer != nil, currentSmallCount == smallCount { return }
         animTimer?.invalidate()
         currentSmallCount = smallCount
+        currentFrames = frames(for: smallCount)
         frameIndex = 0
         animTimer = Timer.scheduledTimer(withTimeInterval: 0.07, repeats: true) { [weak self] _ in
             guard let self else { return }
-            let total = self.swimFrames.count
+            let total = self.currentFrames.count
             let f = self.frameIndex % total
             self.frameIndex += 1
-            let main = self.swimFrames[f]
+            let main = self.currentFrames[f]
             // Each follower rides its own frame (8-frame lag per member):
             // it keeps swimming until IT reaches the lane end, then turns.
             var members: [(x: CGFloat, p: CGFloat)] = []
             for i in 0..<self.currentSmallCount {
                 let lag = 8 * (i + 1)
-                let m = self.swimFrames[(f - lag + total) % total]
+                let m = self.currentFrames[(f - lag + total) % total]
                 members.append((x: m.x, p: m.p))
             }
             self.item.button?.image = Self.swimIcon(centerX: main.x,
@@ -413,17 +423,17 @@ final class StatusItemController {
         }
     }
 
-    /// Canvas width: the lane (8→48) plus whale edges; every fish shares
-    /// the same lane, so the width is constant regardless of fleet size.
+    /// Canvas width: the lane grows with the fleet (40pt base + 16pt per
+    /// follower) plus whale edges, so bigger fleets swim a longer lane.
     static func swimCanvasWidth(smallCount: Int) -> CGFloat {
-        58
+        58 + 16 * CGFloat(min(smallCount, 19))
     }
 
     /// Busy: the leader whale swims across a 40pt range; each follower rides
     /// the same lane on its own lagged frame — it reaches the lane end and
     /// turns there, not mid-lane.
     static func swimIcon(centerX: CGFloat, p: CGFloat, members: [(x: CGFloat, p: CGFloat)]) -> NSImage {
-        templateImage(size: NSSize(width: 58, height: 18)) {
+        templateImage(size: NSSize(width: swimCanvasWidth(smallCount: members.count), height: 18)) {
             let smallAlphas: [CGFloat] = [0.78, 0.58, 0.42]
             for (i, m) in members.enumerated() {
                 let alpha = smallAlphas[min(i, smallAlphas.count - 1)]
