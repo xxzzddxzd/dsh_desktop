@@ -1,60 +1,69 @@
 # DSH Desktop
 
-DSH（DeepSeek Harness）的 macOS 菜单栏伴侣应用：把 DSH 变成一个常驻菜单栏、随时可呼出的桌面应用。纯 Swift + AppKit + WebKit 实现，**不修改 DSH 核心** —— 只通过 DSH 服务已有的 HTTP RPC 与两条 WebSocket 事件流读取实时进度，并把 Web UI 内嵌到弹出面板里。
+A macOS menu bar companion for [DSH (DeepSeek Harness)](https://github.com/deepseek-ai/deepseek-harness) — turn DSH into an always-on, summon-anytime desktop app. Pure Swift + AppKit + WebKit, **no changes to DSH's core**: it reads real-time progress through DSH's existing HTTP RPC and two WebSocket event streams, and embeds the web UI in a popover panel.
 
-## 功能一览
+[简体中文](README.zh.md)
 
-- **菜单栏状态机**：鲸鱼图标即状态（空闲 / 呼吸脉动 / 待办进度环 / 高信号文字），事件闪现 + 气泡简报 + 系统通知（目标阻塞、任务完成、等待输入、需要授权三管齐下）
-- **点击即开的面板**：内嵌 DSH Web UI（常驻加载），支持拖拽调大小、窗口模式、⌃⌥D 全局快捷键
-- **按项目归类的会话清单**：右键菜单直接跳到对应对话
-- **服务管家（默认仅校验/挂载）**：自动发现端口上已运行的 DSH 并挂载，实时校验状态；不启动、不停止你的 dsh（实验性托管/launchd 模式可选）
-- **dsh 环境自检**：启动时定位 `dsh`，未安装弹出引导一键 `npm install -g @deepseek-ai/dsh@latest`；每日检查更新，一键升级
-- **版本白名单**：启动时校验 dsh 版本是否在已收录版本族内，未收录仅提示可能不兼容
+## Highlights
 
-详细功能与架构见 [docs/FEATURES.md](docs/FEATURES.md)；与 DSH 的耦合面和升级清单见 [UPGRADE.md](UPGRADE.md)。
+- **Menu bar state machine**: the whale icon is the status (idle / breathing pulse / todo progress ring / high-signal text), with event flashes, bubble briefings, and system notifications (goal blocked, task done, waiting for input, approval needed)
+- **Click-to-open panel**: embedded DSH Web UI (persistent), resizable, window mode, ⌃⌥D global hotkey
+- **Sessions grouped by project**: right-click menu jumps straight to a conversation
+- **Server manager (attach-only by default)**: auto-discovers a running DSH on the port and attaches, verifying status in real time; never starts or stops your dsh (experimental managed / launchd modes available)
+- **dsh environment self-check**: locates `dsh` at launch; if missing, an onboarding window installs it via `npm install -g @deepseek-ai/dsh@latest`; daily update checks with one-click upgrade
+- **Version whitelist**: warns (non-blocking) when the installed dsh version is not in the verified family list
 
-## 要求
+Detailed features & architecture: [docs/FEATURES.md](docs/FEATURES.md)（中文）.
+Coupling surface & upgrade checklist: [UPGRADE.md](UPGRADE.md)（中文）.
 
-- macOS 13+（Apple Silicon）
-- [DSH](https://github.com/deepseek-ai/deepseek-harness)：`npm install -g @deepseek-ai/dsh`
-- 未安装 DSH 时应用会自动引导安装（需要 Node.js ≥ 20）
+## Requirements
 
-## 安装
+- macOS 13+ (Apple Silicon)
+- [DSH](https://github.com/deepseek-ai/deepseek-harness): `npm install -g @deepseek-ai/dsh`
+- The app guides the install automatically when DSH is missing (requires Node.js ≥ 20)
 
-**一键安装**（下载最新 GitHub Release 到 /Applications，自动去除 quarantine）：
+## Install
+
+**One-liner** (downloads the latest GitHub release into /Applications, clears quarantine):
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/xxzzddxzd/dsh_desktop/main/install.sh | bash
 ```
 
-**Homebrew**：
+**Homebrew**:
 
 ```bash
 brew tap xxzzddxzd/dsh_desktop
 brew install --cask dsh-desktop
 ```
 
-**从源码构建**（需要 Xcode Command Line Tools）：
+**Build from source** (requires Xcode Command Line Tools):
 
 ```bash
-./scripts/build.sh          # 产物：dist/DSH Desktop.app（ad-hoc 签名）
-./install.sh                # 安装本地构建到 /Applications
+./scripts/build.sh          # produces dist/DSH Desktop.app (ad-hoc signed)
+./install.sh                # installs the local build into /Applications
 ```
 
-> 应用为 ad-hoc 签名、未公证：一键脚本会自动去除 quarantine；手动下载安装后
-> 若 Gatekeeper 拦截，右键 → 打开。正式分发建议 Developer ID 签名 + 公证
-> （见 [UPGRADE.md](UPGRADE.md)）。
+> The app is ad-hoc signed and not notarized: the one-liner clears quarantine
+> automatically; for a manual download, right-click → Open if Gatekeeper blocks it.
+> For public distribution consider Developer ID signing + notarization
+> (see [UPGRADE.md](UPGRADE.md)).
 >
-> 发布新版本：`./scripts/release.sh`（构建 + 打包 + gh release）。ad-hoc 构建
-> 每次产物哈希不同，发布前需同步 `Casks/dsh-desktop.rb` 的 sha256（脚本会校验）。
+> Publishing a new release: `./scripts/release.sh` (build + package + gh release).
+> Ad-hoc builds are not reproducible across rebuilds, so sync the
+> `Casks/dsh-desktop.rb` sha256 before publishing (the script verifies it).
 
-## 使用
+## Usage
 
-首次启动自动检查 dsh 环境并请求通知授权。启动 dsh 后（终端运行
-`dsh web`，或菜单「在终端中启动 DSH…」自动开终端并复制命令），应用自动挂载。
+On first launch the app checks the dsh environment and requests notification permission.
+Start dsh (run `dsh web` in a terminal, or use the menu item “Launch DSH in Terminal…”
+which opens a terminal and copies the command), and the app attaches automatically.
 
-菜单栏：**左键** = 面板，**右键** = 菜单（会话列表、服务状态、dsh 更新、设置、退出）。
+Menu bar: **left-click** = panel, **right-click** = menu (sessions, server status, dsh updates, settings, quit).
 
-## 与 DSH 的兼容性
+## Compatibility with DSH
 
-只读消费 DSH 的公开协议（`session.list`、`host.describe`、两条事件流），未知字段全部忽略。当前已收录版本族：`0.1.0`（含 rc 系列）；检测到未收录版本时启动会提示可能不兼容。DSH 发新版后桌面端的更新步骤见 [UPGRADE.md](UPGRADE.md)。
+Read-only consumer of DSH's public protocol (`session.list`, `host.describe`, two event
+streams); unknown fields are ignored. Verified version family: `0.1.0` (incl. rc series);
+unlisted versions trigger a non-blocking compatibility warning at launch. See
+[UPGRADE.md](UPGRADE.md) for the procedure when DSH ships a new release.
