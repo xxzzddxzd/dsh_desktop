@@ -19,12 +19,34 @@ DSH（DeepSeek Harness）的 macOS 菜单栏伴侣应用：把 DSH 变成一个�
 - [DSH](https://github.com/deepseek-ai/deepseek-harness)：`npm install -g @deepseek-ai/dsh`
 - 未安装 DSH 时应用会自动引导安装（需要 Node.js ≥ 20）
 
-## 构建与安装
+## 安装
+
+**一键安装**（下载最新 GitHub Release 到 /Applications，自动去除 quarantine）：
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/xxzzddxzd/dsh_desktop/main/install.sh | bash
+```
+
+**Homebrew**：
+
+```bash
+brew tap xxzzddxzd/dsh_desktop
+brew install --cask dsh-desktop
+```
+
+**从源码构建**（需要 Xcode Command Line Tools）：
 
 ```bash
 ./scripts/build.sh          # 产物：dist/DSH Desktop.app（ad-hoc 签名）
-./install.sh                # 安装到 /Applications
+./install.sh                # 安装本地构建到 /Applications
 ```
+
+> 应用为 ad-hoc 签名、未公证：一键脚本会自动去除 quarantine；手动下载安装后
+> 若 Gatekeeper 拦截，右键 → 打开。正式分发建议 Developer ID 签名 + 公证
+> （见 [UPGRADE.md](UPGRADE.md)）。
+>
+> 发布新版本：`./scripts/release.sh`（构建 + 打包 + gh release）。ad-hoc 构建
+> 每次产物哈希不同，发布前需同步 `Casks/dsh-desktop.rb` 的 sha256（脚本会校验）。
 
 ## 使用
 
