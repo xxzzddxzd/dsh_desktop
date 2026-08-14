@@ -613,9 +613,12 @@ final class AppState {
                 s.busyStartSteps = 0
 
                 // If the user messaged this session within the last 5
-                // minutes they are actively watching it — the completion is
-                // self-evident and must not prompt anywhere.
-                let engaged = s.lastUserMessageAt > 0 && now - s.lastUserMessageAt < 300
+                // minutes AND nothing else is running, they are watching the
+                // only show — the completion is self-evident and stays quiet.
+                // With other sessions still working, a completion is news
+                // (which one finished?) and alerts normally.
+                let othersRunning = sessions.values.contains { $0.id != s.id && $0.running }
+                let engaged = s.lastUserMessageAt > 0 && now - s.lastUserMessageAt < 300 && !othersRunning
 
                 // Turns under 8s are not worth a queue entry.
                 if duration >= 8, !engaged, now - s.lastTurnEventAt > 20 {
