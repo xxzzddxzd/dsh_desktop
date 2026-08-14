@@ -1,0 +1,14 @@
+# Build artifacts
+dist/
+*.app
+
+# macOS
+.DS_Store
+*.log
+
+# Swift module caches / Xcode
+.build/
+.build-args.json
+.swiftpm/
+DerivedData/
+*.xcuserstate
