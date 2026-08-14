@@ -210,6 +210,7 @@ final class PanelController: NSObject, NSPopoverDelegate, WKNavigationDelegate, 
     private var loggedFinish = false
     private var loggedFailure = false
     private var pendingSessionTitle: String?
+    private var pendingSessionId: String?
     private var selectRetries = 0
     private var selectInProgress = false
 
@@ -351,15 +352,57 @@ final class PanelController: NSObject, NSPopoverDelegate, WKNavigationDelegate, 
         panelVC.webView.reloadFromOrigin()
     }
 
-    /// Opens the panel on a specific session. The web UI has no URL deep
-    /// link, so we drive its session switcher: click the session crumb →
-    /// pick the matching row in the picker → verify the crumb changed.
-    /// All steps use synchronous JS snippets staged from Swift.
+    /// Opens the panel on a specific session by driving the web UI's own
+    /// sidebar: expand it, click the session row matching the title.
     func openSession(id: String, title: String) {
-        pendingSessionTitle = title.isEmpty ? nil : title
+        guard !id.isEmpty, !title.isEmpty else { return }
+        pendingSessionId = id
+        pendingSessionTitle = title
         selectRetries = 0
         ensureWebView()
-        selectStageOpenPicker()
+        jumpStageEnsureSidebar()
+    }
+
+    private func jumpStageEnsureSidebar() {
+        guard let title = pendingSessionTitle, webViewLoaded, !selectInProgress else { return }
+        selectInProgress = true
+        evaluate(Self.sidebarEnsureScript(), tag: "jump-sidebar") { [weak self] result in
+            guard let self else { return }
+            if Settings.shared.debugDump {
+                LogStore.shared.append("jump-sidebar: \(result ?? "nil")", source: "debug")
+            }
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.9) { [weak self] in
+                self?.jumpStagePickRow(title: title)
+            }
+        }
+    }
+
+    private func jumpStagePickRow(title: String) {
+        guard pendingSessionTitle != nil else { return }
+        evaluate(Self.sessionRowClickScript(title: title), tag: "jump-pick") { [weak self] result in
+            guard let self else { return }
+            let ok = (result ?? "").hasPrefix("clicked")
+            if Settings.shared.debugDump {
+                LogStore.shared.append("jump-pick: \(result ?? "nil") ok=\(ok)", source: "debug")
+            }
+            if ok {
+                self.pendingSessionTitle = nil
+                self.pendingSessionId = nil
+                self.selectInProgress = false
+                return
+            }
+            self.selectRetries += 1
+            if self.selectRetries < 8 {
+                self.selectInProgress = false
+                DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) { [weak self] in
+                    self?.jumpStageEnsureSidebar()
+                }
+            } else {
+                self.pendingSessionTitle = nil
+                self.pendingSessionId = nil
+                self.selectInProgress = false
+            }
+        }
     }
 
     private func selectStageOpenPicker() {
@@ -405,8 +448,11 @@ final class PanelController: NSObject, NSPopoverDelegate, WKNavigationDelegate, 
                 return
             }
             self.selectRetries += 1
-            if self.selectRetries < 6 {
-                DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) { [weak self] in
+            if self.selectRetries < 8 {
+                // Reset the in-progress flag so the retry can actually run
+                // (a failed first attempt must not dead-lock the flow).
+                self.selectInProgress = false
+                DispatchQueue.main.asyncAfter(deadline: .now() + 1.2) { [weak self] in
                     self?.selectStageOpenPicker()
                 }
             } else {
@@ -428,8 +474,61 @@ final class PanelController: NSObject, NSPopoverDelegate, WKNavigationDelegate, 
             return
         }
         let dumpScript = Self.dumpScript(needle: needle, idPrefix: idPrefix)
-        if click == "crumb" {
-            evaluate(Self.crumbClickScript(), tag: "probe-click") { [weak self] result in
+        if click == "openside" {
+            evaluate(Self.sidebarToggleScript(), tag: "probe-click") { [weak self] result in
+                LogStore.shared.append("probe-click: \(result ?? "nil")", source: "debug")
+                DispatchQueue.main.asyncAfter(deadline: .now() + 1.6) { [weak self] in
+                    self?.evaluate(Self.sidebarDumpScript(), tag: "dom-probe") { text in
+                        LogStore.shared.append("dom-probe: \(text ?? "nil")", source: "debug")
+                    }
+                }
+            }
+            return
+        }
+        if click == "railbtn" {
+            evaluate(Self.railBtnDumpScript(), tag: "dom-probe") { text in
+                LogStore.shared.append("dom-probe: \(text ?? "nil")", source: "debug")
+            }
+            return
+        }
+        if click == "railtoggle" {
+            evaluate(Self.railToggleScript(), tag: "probe-click") { [weak self] result in
+                LogStore.shared.append("probe-click: \(result ?? "nil")", source: "debug")
+                DispatchQueue.main.asyncAfter(deadline: .now() + 1.6) { [weak self] in
+                    self?.evaluate(Self.railDumpScript(), tag: "dom-probe") { text in
+                        LogStore.shared.append("dom-probe: \(text ?? "nil")", source: "debug")
+                    }
+                }
+            }
+            return
+        }
+        if click == "ls" {
+            evaluate(Self.lsDumpScript(), tag: "dom-probe") { text in
+                LogStore.shared.append("dom-probe: \(text ?? "nil")", source: "debug")
+            }
+            return
+        }
+        if click == "rail" {
+            evaluate(Self.railDumpScript(), tag: "dom-probe") { text in
+                LogStore.shared.append("dom-probe: \(text ?? "nil")", source: "debug")
+            }
+            return
+        }
+        if click == "modules" {
+            evaluate(Self.modulesDumpScript(), tag: "dom-probe") { text in
+                LogStore.shared.append("dom-probe: \(text ?? "nil")", source: "debug")
+            }
+            return
+        }
+        if click == "header" {
+            evaluate(Self.headerDumpScript(), tag: "dom-probe") { text in
+                LogStore.shared.append("dom-probe: \(text ?? "nil")", source: "debug")
+            }
+            return
+        }
+        if click == "crumb" || click == "workspace" {
+            let script = click == "workspace" ? Self.workspaceChipClickScript() : Self.crumbClickScript()
+            evaluate(script, tag: "probe-click") { [weak self] result in
                 LogStore.shared.append("probe-click: \(result ?? "nil")", source: "debug")
                 DispatchQueue.main.asyncAfter(deadline: .now() + 1.6) { [weak self] in
                     self?.evaluate(dumpScript, tag: "dom-probe") { text in
@@ -468,6 +567,233 @@ final class PanelController: NSObject, NSPopoverDelegate, WKNavigationDelegate, 
         s.replacingOccurrences(of: "\\", with: "\\\\")
             .replacingOccurrences(of: "\"", with: "\\\"")
             .replacingOccurrences(of: "\n", with: " ")
+    }
+
+    /// Click the sidebar toggle (aria-label 打开侧边栏).
+    static func sidebarToggleScript() -> String {
+        """
+        (() => {
+          const btn = document.querySelector('[aria-label="打开侧边栏"]');
+          if (!btn) return 'no-toggle';
+          const r = btn.getBoundingClientRect();
+          const o = { bubbles: true, cancelable: true, view: window,
+                      clientX: r.x + r.width / 2, clientY: r.y + r.height / 2,
+                      button: 0, buttons: 1, detail: 1 };
+          btn.dispatchEvent(new PointerEvent('pointerdown', { bubbles: true, cancelable: true, pointerId: 1, pointerType: 'mouse' }));
+          btn.dispatchEvent(new MouseEvent('mousedown', o));
+          btn.dispatchEvent(new MouseEvent('mouseup', Object.assign({}, o, { buttons: 0 })));
+          btn.dispatchEvent(new MouseEvent('click', Object.assign({}, o, { buttons: 0 })));
+          return 'clicked';
+        })();
+        """
+    }
+
+    /// Dump the expanded sidebar's session rows (left 420px, buttons only).
+    static func sidebarDumpScript() -> String {
+        """
+        (() => {
+          const out = [];
+          for (const el of document.querySelectorAll('button, [role="button"], [role="option"], [role="treeitem"], [role="listitem"]')) {
+            const r = el.getBoundingClientRect();
+            if (!(r.left < 460 && r.width > 100 && r.height > 10)) continue;
+            const cls = typeof el.className === 'string' ? el.className.slice(0, 48) : '';
+            const t = (el.textContent || '').replace(/\\s+/g, ' ').trim().slice(0, 40);
+            if (!t) continue;
+            out.push(el.tagName.toLowerCase() + '.' + cls + ' | ' + t);
+          }
+          return JSON.stringify(out.slice(0, 40));
+        })();
+        """
+    }
+
+    /// Dump clickable elements inside the leftmost 80px (session rail area).
+    static func railBtnDumpScript() -> String {
+        """
+        (() => {
+          const out = [];
+          for (const el of document.querySelectorAll('button, [role="button"], [tabindex="0"]')) {
+            const r = el.getBoundingClientRect();
+            if (!(r.left < 90 && r.width > 8 && r.height > 8)) continue;
+            const cls = typeof el.className === 'string' ? el.className.slice(0, 50) : '';
+            const t = (el.textContent || '').replace(/\\s+/g, ' ').trim().slice(0, 24);
+            const aria = (el.getAttribute('aria-label') || '').slice(0, 30);
+            out.push(el.tagName.toLowerCase() + '.' + cls + ' aria=' + aria + ' | ' + t);
+          }
+          return JSON.stringify(out.slice(0, 30));
+        })();
+        """
+    }
+
+    /// Click the collapsed sidebar rail trigger.
+    static func railToggleScript() -> String {
+        """
+        (() => {
+          const btn = document.querySelector('[class*="VOzbGW_trigger"], button[class*="rail"]');
+          if (!btn) return 'no-trigger';
+          const r = btn.getBoundingClientRect();
+          const o = { bubbles: true, cancelable: true, view: window,
+                      clientX: r.x + r.width / 2, clientY: r.y + r.height / 2,
+                      button: 0, buttons: 1, detail: 1 };
+          try {
+            btn.dispatchEvent(new PointerEvent('pointerdown', { bubbles: true, cancelable: true, pointerId: 1, pointerType: 'mouse' }));
+            btn.dispatchEvent(new MouseEvent('mousedown', o));
+            btn.dispatchEvent(new MouseEvent('mouseup', Object.assign({}, o, { buttons: 0 })));
+            btn.dispatchEvent(new MouseEvent('click', Object.assign({}, o, { buttons: 0 })));
+          } catch (e) { try { btn.click(); } catch (e2) { return 'click-error'; } }
+          return 'clicked';
+        })();
+        """
+    }
+
+    /// Dump localStorage keys + any sidebar-ish elements (even hidden).
+    static func lsDumpScript() -> String {
+        """
+        (() => {
+          const out = { ls: [], side: [] };
+          try {
+            for (let i = 0; i < localStorage.length; i++) {
+              const k = localStorage.key(i);
+              const v = (localStorage.getItem(k) || '').slice(0, 80);
+              out.ls.push(k + '=' + v);
+            }
+          } catch (e) { out.ls.push('err:' + e.message); }
+          for (const el of document.querySelectorAll('*')) {
+            const cls = typeof el.className === 'string' ? el.className : '';
+            if (/sidebar|sidepanel|rail|aside|navigation|drawer|panel/i.test(cls) && out.side.length < 30) {
+              const r = el.getBoundingClientRect();
+              const t = (el.textContent || '').replace(/\\s+/g, ' ').trim().slice(0, 30);
+              out.side.push(el.tagName.toLowerCase() + '.' + cls.slice(0, 44) + ' | w=' + Math.round(r.width) + ' | ' + t);
+            }
+          }
+          return JSON.stringify(out);
+        })();
+        """
+    }
+
+    /// Dump non-empty elements in the left 320px (potential session rail).
+    static func railDumpScript() -> String {
+        """
+        (() => {
+          const out = [];
+          for (const el of document.querySelectorAll('*')) {
+            const r = el.getBoundingClientRect();
+            if (!(r.left < 320 && r.width > 60 && r.height > 10)) continue;
+            const t = (el.textContent || '').replace(/\\s+/g, ' ').trim().slice(0, 44);
+            if (!t) continue;
+            const cls = typeof el.className === 'string' ? el.className.slice(0, 44) : '';
+            out.push(el.tagName.toLowerCase() + '.' + cls + ' | ' + t);
+          }
+          return JSON.stringify(out.slice(0, 40));
+        })();
+        """
+    }
+
+    /// Inspect the module registry the web app exposes on window.
+    static func modulesDumpScript() -> String {
+        """
+        (() => {
+          const reg = window.__DSH_MODULES__;
+          if (!reg) return 'no-__DSH_MODULES__';
+          const keys = Object.keys(reg);
+          const out = { count: keys.length, keys: keys.slice(0, 60) };
+          // If a key exposes an object, note its top-level keys.
+          for (const k of keys.slice(0, 30)) {
+            try {
+              const v = reg[k];
+              if (v && typeof v === 'object') {
+                out[k] = Object.keys(v).slice(0, 12);
+              } else if (typeof v === 'function') {
+                out[k] = 'function';
+              }
+            } catch (e) { out[k] = 'err'; }
+          }
+          return JSON.stringify(out);
+        })();
+        """
+    }
+
+    /// Dump every non-empty element in the top 80px (header area).
+    static func headerDumpScript() -> String {
+        """
+        (() => {
+          const out = [];
+          for (const el of document.querySelectorAll('*')) {
+            const r = el.getBoundingClientRect();
+            if (!(r.top < 80 && r.height > 6)) continue;
+            const t = (el.textContent || '').replace(/\\s+/g, ' ').trim().slice(0, 40);
+            if (!t) continue;
+            const cls = typeof el.className === 'string' ? el.className.slice(0, 48) : '';
+            out.push(el.tagName.toLowerCase() + '.' + cls + ' | ' + t);
+          }
+          return JSON.stringify(out.slice(0, 40));
+        })();
+        """
+    }
+
+    /// Click the workspace chip (the trigger next to the breadcrumbs).
+    static func workspaceChipClickScript() -> String {
+        """
+        (() => {
+          const chip = document.querySelector('[class*="cardWorkspaceTrigger"]');
+          if (!chip) return 'no-chip';
+          const r = chip.getBoundingClientRect();
+          const o = { bubbles: true, cancelable: true, view: window,
+                      clientX: r.x + r.width / 2, clientY: r.y + r.height / 2,
+                      button: 0, buttons: 1, detail: 1 };
+          try {
+            chip.dispatchEvent(new PointerEvent('pointerdown', { bubbles: true, cancelable: true, pointerId: 1, pointerType: 'mouse' }));
+            chip.dispatchEvent(new MouseEvent('mousedown', o));
+            chip.dispatchEvent(new MouseEvent('mouseup', Object.assign({}, o, { buttons: 0 })));
+            chip.dispatchEvent(new MouseEvent('click', Object.assign({}, o, { buttons: 0 })));
+          } catch (e) { try { chip.click(); } catch (e2) { return 'click-error'; } }
+          return 'clicked';
+        })();
+        """
+    }
+
+    /// Ensure the sidebar is expanded (click its toggle when collapsed).
+    static func sidebarEnsureScript() -> String {
+        """
+        (() => {
+          const open = document.querySelector('[aria-label="打开侧边栏"]');
+          if (open) {
+            open.click();
+            return 'clicked-open';
+          }
+          if (document.querySelector('[aria-label="关闭侧边栏"]')) return 'already-open';
+          const t = document.querySelector('[class*="hHd-Xa_toggle"]');
+          if (t) { t.click(); return 'clicked-fallback'; }
+          return 'no-toggle';
+        })();
+        """
+    }
+
+    /// Click the sidebar session row whose text contains the title.
+    static func sessionRowClickScript(title: String) -> String {
+        let t = jsEscape(title)
+        return """
+        (() => {
+          const t = "\(t)";
+          const norm = s => (s || '').replace(/\\s+/g, ' ').trim();
+          const rows = Array.from(document.querySelectorAll('[class*="YDXeBa_sessionRow"]'));
+          let best = null;
+          for (const row of rows) {
+            if (norm(row.textContent).includes(t)) { best = row; break; }
+          }
+          if (!best) return 'not-found';
+          const r = best.getBoundingClientRect();
+          const o = { bubbles: true, cancelable: true, view: window,
+                      clientX: r.x + r.width / 2, clientY: r.y + r.height / 2,
+                      button: 0, buttons: 1, detail: 1 };
+          try {
+            best.dispatchEvent(new PointerEvent('pointerdown', { bubbles: true, cancelable: true, pointerId: 1, pointerType: 'mouse' }));
+            best.dispatchEvent(new MouseEvent('mousedown', o));
+            best.dispatchEvent(new MouseEvent('mouseup', Object.assign({}, o, { buttons: 0 })));
+            best.dispatchEvent(new MouseEvent('click', Object.assign({}, o, { buttons: 0 })));
+          } catch (e) { try { best.click(); } catch (e2) { return 'click-error'; } }
+          return 'clicked';
+        })();
+        """
     }
 
     /// Click the deepest breadcrumb (the session-level crumb) to open the
@@ -612,8 +938,8 @@ final class PanelController: NSObject, NSPopoverDelegate, WKNavigationDelegate, 
             LogStore.shared.append("Web UI 加载完成", source: "desktop")
         }
         if pendingSessionTitle != nil {
-        if pendingSessionTitle != nil {
-            selectStageOpenPicker()
+        if pendingSessionTitle != nil, !selectInProgress {
+            jumpStageEnsureSidebar()
         }
         }
     }

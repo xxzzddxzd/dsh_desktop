@@ -29,7 +29,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                     if !self.panelCtrl.isPopoverShown {
                         self.panelCtrl.togglePopover(relativeTo: button)
                     }
-                    self.panelCtrl.openSession(id: sessionId, title: "")
+                    let title = AppState.shared.snapshot().sessions.first(where: { $0.id == sessionId })?.title ?? ""
+                    self.panelCtrl.openSession(id: sessionId, title: title)
                     AppState.shared.consumeFrontEvent()
                     if self.panelCtrl.isPopoverShown { self.installDismissMonitors() }
                 } else {
@@ -198,9 +199,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 LogStore.shared.append("debug: popover shown=\(self.panelCtrl.isPopoverShown)", source: "desktop")
             }
         }
-        if !Settings.shared.debugSelectTitle.isEmpty {
+        if !Settings.shared.debugSelectId.isEmpty {
             DispatchQueue.main.asyncAfter(deadline: .now() + 3) { [weak self] in
-                self?.panelCtrl.openSession(id: "", title: Settings.shared.debugSelectTitle)
+                let id = Settings.shared.debugSelectId
+                let title = AppState.shared.snapshot().sessions.first(where: { $0.id == id })?.title ?? ""
+                self?.panelCtrl.openSession(id: id, title: title)
             }
         }
         // Live DOM probe: watch defaults so probes can be triggered without

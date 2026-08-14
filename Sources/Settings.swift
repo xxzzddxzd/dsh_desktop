@@ -134,6 +134,11 @@ final class Settings {
         get { defaults.bool(forKey: "debugAutoOpen") }
         set { defaults.set(newValue, forKey: "debugAutoOpen") }
     }
+    /// Headless verification aid: jump to this session id at launch.
+    var debugSelectId: String {
+        get { defaults.string(forKey: "debugSelectId") ?? "" }
+        set { defaults.set(newValue, forKey: "debugSelectId") }
+    }
     /// Headless verification aid: select this session title at launch.
     var debugSelectTitle: String {
         get { defaults.string(forKey: "debugSelectTitle") ?? "" }
