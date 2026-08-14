@@ -912,12 +912,19 @@ final class AppState {
         for (key, at) in recentlyViewedAt where nowNow - at > 90 {
             recentlyViewedAt.removeValue(forKey: key)
         }
-        // A running flag with no recent activity is a phantom (idle session):
-        // render it as idle so the bar doesn't swim forever.
-        for key in sessions.keys {
-            guard let s = sessions[key], s.running, s.lastActivityAt > 0,
-                  nowNow - s.lastActivityAt > 300 else { continue }
-            sessions[key]?.running = false
+        // Zombie guard: a session the server still flags running but that
+        // shows NO freshness evidence — neither app-observed activity nor a
+        // recent server updatedAt — renders as idle. This only shapes the
+        // SNAPSHOT (display); the stored flag still drives completion
+        // detection, so a late true→false transition stays harmless.
+        for i in snap.sessions.indices {
+            let s = snap.sessions[i]
+            guard s.running else { continue }
+            let recentActivity = s.lastActivityAt > 0 && nowNow - s.lastActivityAt < 300
+            let recentUpdate = s.updatedAt > 0 && nowNow - s.updatedAt < 600
+            if !recentActivity && !recentUpdate {
+                snap.sessions[i].running = false
+            }
         }
         // Hard expiry: a waiting flag that survives 10 minutes with no
         // resolution frame is stale (missed frame / WS gap) — drop it.
