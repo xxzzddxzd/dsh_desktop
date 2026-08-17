@@ -342,14 +342,42 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             anchor: statusItemCtrl.button,
             ttl: 60,
             buttons: [
-                ("允许", { [weak self] in self?.respondApproval(info, outcome: "allowed-once", tag: tag) }),
                 ("拒绝", { [weak self] in self?.respondApproval(info, outcome: "rejected", tag: tag) }),
+                ("允许一次", { [weak self] in self?.respondApproval(info, outcome: "allowed-once", tag: tag) }),
+                ("始终允许", { [weak self] in self?.alwaysAllow(info, tag: tag) }),
             ],
             tag: tag,
             onClick: { [weak self] in
                 guard let self, let button = self.statusItemCtrl.button else { return }
                 self.panelCtrl.togglePopover(relativeTo: button)
             })
+    }
+
+    /// Switch this session to danger-full-access, then allow the pending
+    /// operation. The permission command is user-initiated and durable.
+    private func alwaysAllow(_ info: ApprovalInfo, tag: String) {
+        DshRpc(port: Settings.shared.port).executeCommand(
+            sessionId: info.sessionId,
+            line: "/permission danger-full-access") { [weak self] result in
+                DispatchQueue.main.async {
+                    guard let self else { return }
+                    switch result {
+                    case .success:
+                        LogStore.shared.append("当前会话已切换 danger-full-access：\(info.sessionId.prefix(13))", source: "desktop")
+                        self.respondApproval(info, outcome: "allowed-once", tag: tag)
+                    case .failure(let error):
+                        self.approvalTags[info.approvalId] = nil
+                        BubbleController.shared.dismiss(tag: tag)
+                        LogStore.shared.append("始终允许失败：\(error.localizedDescription)", source: "desktop")
+                        BubbleController.shared.show(
+                            title: "始终允许失败",
+                            body: error.localizedDescription,
+                            anchor: self.statusItemCtrl.button,
+                            ttl: 8,
+                            onClick: nil)
+                    }
+                }
+            }
     }
 
     private func respondApproval(_ info: ApprovalInfo, outcome: String, tag: String) {

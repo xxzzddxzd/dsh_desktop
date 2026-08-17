@@ -93,6 +93,31 @@ final class DshRpc {
         return outcome
     }
 
+    /// Execute a slash command directly against one live session.
+    func executeCommand(sessionId: String, line: String,
+                        completion: @escaping (Result<String, Error>) -> Void) {
+        call("commands/execute", payload: [
+            "args": ["agentId": sessionId, "line": line],
+        ], timeout: 8) { result in
+            switch result {
+            case .failure(let error):
+                completion(.failure(error))
+            case .success(let value):
+                guard let value = value as? [String: Any],
+                      let commandResult = value["result"] as? [String: Any],
+                      let kind = commandResult["kind"] as? String else {
+                    completion(.failure(RpcError.parse("command returned no result")))
+                    return
+                }
+                if kind == "success" {
+                    completion(.success(commandResult["text"] as? String ?? ""))
+                } else {
+                    completion(.failure(RpcError.rpc(commandResult["text"] as? String ?? "command failed")))
+                }
+            }
+        }
+    }
+
     /// Answer a tool approval: POST /api/respond with a client-response
     /// echoing the request's rpcId. Completion reports whether the server
     /// accepted the answer.
