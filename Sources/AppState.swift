@@ -141,6 +141,7 @@ final class AppState {
     private var serverError = ""
     private var notifyPending = false
     private var lastGoalNotification = ""
+    private var lastAgentErrorNotice: [String: TimeInterval] = [:]
     private var transientEvent: StatusEvent?
     private var muxConnectedAt: TimeInterval = 0
     private var lastMuxFrameAt: TimeInterval = 0
@@ -282,6 +283,7 @@ final class AppState {
         case "host/session-removed":
             if let id = payload["sessionId"] as? String {
                 sessions.removeValue(forKey: id)
+                Notifier.shared.clear(id: "agent-error-\(id)")
             }
         case "host/session-status":
             guard let id = payload["sessionId"] as? String,
@@ -307,11 +309,25 @@ final class AppState {
         case "host/agent-error":
             guard let id = payload["sessionId"] as? String else { return }
             var s = sessions[id] ?? SessionState(id: id)
-            s.lastError = payload["message"] as? String
+            let message = payload["message"] as? String ?? "未知错误"
+            s.lastError = message
             sessions[id] = s
+            let now = Date().timeIntervalSince1970
+            let fresh = (s.lastActivityAt > 0 && now - s.lastActivityAt < 300) || (s.updatedAt > 0 && now - s.updatedAt < 600)
+            guard !s.isSubagent, s.running, fresh else {
+                Notifier.shared.clear(id: "agent-error-\(id)")
+                return
+            }
+            let category = Self.agentErrorCategory(message)
+            let dedupeKey = category == "balance-insufficient" ? category : "\(id):\(category)"
+            let cooldown: TimeInterval = category == "balance-insufficient" ? 3600 : 300
+            let persistedKey = "agentErrorNotice.\(dedupeKey)"
+            let previous = max(lastAgentErrorNotice[dedupeKey] ?? 0, UserDefaults.standard.double(forKey: persistedKey))
+            guard now - previous >= cooldown else { return }
+            lastAgentErrorNotice[dedupeKey] = now
+            UserDefaults.standard.set(now, forKey: persistedKey)
             if Settings.shared.notifyServerEvents && Settings.shared.notificationsEnabled {
-                Notifier.shared.notify(id: "agent-error-\(id)", title: "DSH 会话出错",
-                                       body: s.lastError ?? "未知错误")
+                Notifier.shared.notify(id: "agent-error-\(id)", title: "DSH 会话出错", body: message)
             }
         default:
             break
@@ -615,6 +631,7 @@ final class AppState {
                 LogStore.shared.append("run: \(s.id.prefix(8)) -> false [\(source)]", source: "desktop")
             }
             s.running = false
+            Notifier.shared.clear(id: "agent-error-\(s.id)")
             clearPersistedBusySince(s.id)
             if wasRunning, let since = s.busySince {
                 let duration = now - since
@@ -962,6 +979,14 @@ final class AppState {
                 onChange?()
             }
         }
+    }
+
+    private static func agentErrorCategory(_ message: String) -> String {
+        let m = message.lowercased()
+        if message.contains("余额不足") || m.contains("insufficient balance") || m.contains("insufficient_balance") || (m.contains("balance") && (m.contains("insufficient") || m.contains("not enough"))) {
+            return "balance-insufficient"
+        }
+        return String(m.prefix(160))
     }
 
     private func truncate(_ s: String, limit: Int) -> String {
