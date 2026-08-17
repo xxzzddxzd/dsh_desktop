@@ -78,6 +78,7 @@ struct SessionState {
     var waitingKind: String = ""   // "question" | "approval"
     var waitingSince: TimeInterval = 0
     var lastError: String?
+    var isSubagent = false
     var lastActivityAt: TimeInterval = 0
     var lastUserMessageAt: TimeInterval = 0
     var busySince: TimeInterval?
@@ -272,6 +273,10 @@ final class AppState {
             guard !id.isEmpty else { return }
             var s = sessions[id] ?? SessionState(id: id)
             s.blank = payload["blank"] as? Bool ?? false
+            if payload["origin"] as? String == "subagent" { s.isSubagent = true }
+            if let parent = payload["parentSessionId"] as? String, !parent.isEmpty {
+                s.isSubagent = true
+            }
             if let cwd = payload["cwd"] as? String { s.cwd = cwd }
             sessions[id] = s
         case "host/session-removed":
@@ -374,8 +379,10 @@ final class AppState {
                 s.waitingReason = "需要你的回答"
             }
             sessions[sid] = s
-            enqueueEvent(.question, sessionId: sid, title: s.title,
-                         text: "等你回答 · \(truncate(s.waitingReason, limit: 26))", urgent: true)
+            if !s.isSubagent {
+                enqueueEvent(.question, sessionId: sid, title: s.title,
+                             text: "等你回答 · \(truncate(s.waitingReason, limit: 26))", urgent: true)
+            }
             if Settings.shared.wantsBubble {
                 let reason = truncate(s.waitingReason, limit: 140)
                 DispatchQueue.main.async { [weak self] in
@@ -407,8 +414,10 @@ final class AppState {
                                         rpcId: rpcId,
                                         toolName: tool,
                                         reason: reason)
-            enqueueEvent(.approval, sessionId: sid, title: s.title,
-                         text: "待审批 · \(truncate(tool, limit: 12))\(reason.isEmpty ? "" : "：" + truncate(reason, limit: 14))", urgent: true)
+            if !s.isSubagent {
+                enqueueEvent(.approval, sessionId: sid, title: s.title,
+                             text: "待审批 · \(truncate(tool, limit: 12))\(reason.isEmpty ? "" : "：" + truncate(reason, limit: 14))", urgent: true)
+            }
             if Settings.shared.wantsBubble {
                 DispatchQueue.main.async { [weak self] in
                     self?.onApproval?(approval)
@@ -568,6 +577,9 @@ final class AppState {
         }
         restoreBusySince(&s)
         s.blank = item["blank"] as? Bool ?? false
+        if let parent = item["parentSessionId"] as? String, !parent.isEmpty {
+            s.isSubagent = true
+        }
         if let cwd = item["cwd"] as? String { s.cwd = cwd }
         if let projections = item["projections"] as? [String: Any],
            let values = projections["values"] as? [String: Any] {
@@ -621,7 +633,7 @@ final class AppState {
                 let engaged = s.lastUserMessageAt > 0 && now - s.lastUserMessageAt < 300 && !othersRunning
 
                 // Turns under 8s are not worth a queue entry.
-                if duration >= 8, !engaged, now - s.lastTurnEventAt > 20 {
+                if duration >= 8, !engaged, !s.isSubagent, now - s.lastTurnEventAt > 20 {
                     s.lastTurnEventAt = now
                     let snippet = s.lastAssistantText.isEmpty
                         ? (s.title.isEmpty ? "会话" : s.title)
@@ -634,7 +646,7 @@ final class AppState {
                 // duration + the assistant's closing words). Fires eagerly
                 // (>=5s) so it tracks the status bar, never lags a turn.
                 // Bubbles for real work (>=20s).
-                if duration >= 20, !engaged, now - s.lastTurnBubbleAt > 30, Settings.shared.wantsBubble {
+                if duration >= 20, !engaged, !s.isSubagent, now - s.lastTurnBubbleAt > 30, Settings.shared.wantsBubble {
                     s.lastTurnBubbleAt = now
                     var parts: [String] = []
                     if stepsDelta > 0 { parts.append("步骤 \(stepsDelta)") }
@@ -653,7 +665,7 @@ final class AppState {
                 }
 
                 let coolDown = now - s.lastTurnDoneAt
-                if duration >= 20, !engaged, coolDown > 60,
+                if duration >= 20, !engaged, !s.isSubagent, coolDown > 60,
                    Settings.shared.wantsNotification,
                    Settings.shared.notifyTurnDone, Settings.shared.notificationsEnabled {
                     s.lastTurnDoneAt = now
@@ -692,8 +704,10 @@ final class AppState {
                 lastGoalNotification = key
                 switch goal.phase {
                 case "complete":
-                    enqueueEvent(.goalComplete, sessionId: s.id, title: s.title,
-                                 text: "目标完成 · \(truncate(goal.objective, limit: 22))")
+                    if !s.isSubagent {
+                        enqueueEvent(.goalComplete, sessionId: s.id, title: s.title,
+                                     text: "目标完成 · \(truncate(goal.objective, limit: 22))")
+                    }
                     if Settings.shared.wantsNotification {
                         Notifier.shared.notify(id: "goal-complete-\(s.id)", title: "DSH 目标完成",
                                                body: "「\(truncate(goal.objective, limit: 80))」已完成。")
@@ -788,7 +802,7 @@ final class AppState {
                 $0.content == row.content && $0.status == "completed"
             })
         }
-        if let first = newlyCompleted.first {
+        if let first = newlyCompleted.first, !s.isSubagent {
             let extra = newlyCompleted.count > 1 ? " +\(newlyCompleted.count - 1)" : ""
             enqueueEvent(.completed, sessionId: s.id, title: s.title,
                          text: "完成 \(truncate(first.content, limit: 14))\(extra)")
